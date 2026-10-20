@@ -41,6 +41,7 @@ function button(text, className, action, iconName) {
   return item;
 }
 const params = new URLSearchParams(location.search);
+const pageSizes = Array.from({ length: 10 }, (_, i) => (i + 1) * 48);
 const state = {
   videos: [],
   users: [],
@@ -49,9 +50,9 @@ const state = {
   hideProcessed: params.get("hideProcessed") === "1",
   sort: params.get("sort") === "asc" ? "asc" : "desc",
   page: Math.max(1, Number(params.get("page")) || 1),
-  pageSize: [50, 100, 200, 500].includes(Number(params.get("size")))
+  pageSize: pageSizes.includes(Number(params.get("size")))
     ? Number(params.get("size"))
-    : 100,
+    : 48,
   today: "",
   timeZone: "Asia/Shanghai",
   maxUploadBytes: 2 * 1024 ** 3,
@@ -110,7 +111,7 @@ function syncURL() {
   if (state.hideProcessed) p.set("hideProcessed", "1");
   if (state.sort !== "desc") p.set("sort", state.sort);
   if (state.page > 1) p.set("page", state.page);
-  if (state.pageSize !== 100) p.set("size", state.pageSize);
+  if (state.pageSize !== 48) p.set("size", state.pageSize);
   const query = p.toString();
   history.replaceState(
     null,
