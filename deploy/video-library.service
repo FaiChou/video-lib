@@ -1,0 +1,30 @@
+[Unit]
+Description=Video Library
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=video-library
+Group=video-library
+WorkingDirectory=/opt/video-library
+EnvironmentFile=/etc/default/video-library
+# Change /usr/bin/node if your system-wide Node binary is elsewhere.
+ExecStart=/usr/bin/node /opt/video-library/server.mjs
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=video-library
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/video-library/videos
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#fbfaf8" />
+    <meta
+      name="description"
+      content="片刻 · 简洁的本地视频收藏，按用户与日期轻松浏览。"
+    />
+    <title>片刻 · 视频收藏</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="header-inner" aria-label="主导航">
+        <a href="#library" class="brand" aria-label="回到视频库" title="视频库">
+          <span class="brand-icon" aria-hidden="true">▶</span>
+        </a>
+        <button class="button primary" id="quickUpload">
+          <span data-icon="plus"></span>上传视频
+        </button>
+      </nav>
+    </header>
+    <main class="shell">
+      <section id="libraryView">
+        <section class="collection" aria-labelledby="collectionTitle">
+          <div class="section-heading">
+            <div class="title-line">
+              <h2 id="collectionTitle">全部片刻</h2>
+              <span id="totalCount" class="count-pill">0</span>
+            </div>
+          </div>
+          <div class="filter-row">
+            <div
+              id="userFilters"
+              class="user-filters"
+              role="group"
+              aria-label="按用户名筛选"
+            ></div>
+          </div>
+          <div class="toolbar">
+            <label class="search-box"
+              ><span data-icon="search"></span
+              ><input
+                id="searchInput"
+                type="search"
+                placeholder="搜索视频名称…"
+                aria-label="搜索视频名称"
+            /></label>
+            <div class="toolbar-actions">
+              <label class="sort-control"
+                ><span data-icon="sort"></span
+                ><select id="sortSelect" aria-label="日期排序">
+                  <option value="desc">日期 · 从新到旧</option>
+                  <option value="asc">日期 · 从旧到新</option>
+                </select></label
+              ><button
+                id="refreshButton"
+                class="icon-button"
+                title="刷新视频库"
+                aria-label="刷新视频库"
+              >
+                <span data-icon="refresh"></span>
+              </button>
+            </div>
+          </div>
+          <div class="results-line">
+            <span id="resultSummary" role="status" aria-live="polite"
+              >正在读取视频…</span
+            ><span class="view-hint"
+              ><span data-icon="grid"></span>所有精彩，一目了然</span
+            >
+          </div>
+          <div id="videoGrid" class="video-grid" aria-label="视频列表"></div>
+          <div id="emptyState" class="empty-state" hidden></div>
+          <div id="paginationBar" class="pagination-bar" hidden>
+            <label class="page-size"
+              >每页
+              <select id="pageSizeSelect" aria-label="每页视频数">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+              </select>
+              条</label
+            >
+            <nav id="pagination" class="pagination" aria-label="视频分页"></nav>
+            <span id="pageSummary" class="page-summary"></span>
+          </div>
+        </section>
+      </section>
+      <section
+        id="uploadView"
+        class="upload-view"
+        hidden
+        aria-labelledby="uploadTitle"
+      >
+        <a class="back-link" href="#library"
+          ><span data-icon="arrowLeft"></span>返回视频库</a
+        >
+        <div class="upload-intro">
+          <span class="eyebrow">MAKE ROOM FOR MORE MOMENTS</span>
+          <h1 id="uploadTitle">新的片刻，<span>从这里开始。</span></h1>
+          <p>把视频放进属于它的收藏里。</p>
+        </div>
+        <button class="upload-entry" id="uploadEntry">
+          <span class="upload-large-icon" data-icon="upload"></span
+          ><strong>添加你的精彩瞬间</strong
+          ><span>选择单个或多个视频，一起上传</span
+          ><span class="button primary"
+            >选择视频 <span data-icon="plus"></span></span
+          ><small>支持 MP4、WebM、MOV、M4V</small>
+        </button>
+        <div class="upload-notes">
+          <div>
+            <span>01</span><strong>选好视频</strong>
+            <p>支持多选，也可以拖入上传弹窗。</p>
+          </div>
+          <div>
+            <span>02</span><strong>放入收藏</strong>
+            <p>选择已有用户，或者新建一个名字。</p>
+          </div>
+          <div>
+            <span>03</span><strong>确认日期</strong>
+            <p>自动识别文件名日期，没有则使用今天。</p>
+          </div>
+        </div>
+      </section>
+    </main>
+    <dialog
+      id="playerDialog"
+      class="player-dialog"
+      aria-labelledby="playerTitle"
+    >
+      <div class="player-heading">
+        <div>
+          <h2 id="playerTitle"></h2>
+          <p id="playerMeta"></p>
+        </div>
+        <button id="closePlayer" class="icon-button" aria-label="关闭播放器">
+          <span data-icon="close"></span>
+        </button>
+      </div>
+      <video id="player" controls playsinline preload="metadata"></video>
+      <p id="playbackError" class="error-message" hidden>
+        浏览器无法播放这个视频。可以下载后用本地播放器打开，或转为 H.264 编码的
+        MP4。
+      </p>
+      <div class="player-footer">
+        <span>留一点时间，重温喜欢的瞬间。</span
+        ><a id="playerDownload" class="button secondary" download
+          ><span data-icon="download"></span>下载视频</a
+        >
+      </div>
+    </dialog>
+    <dialog
+      id="uploadDialog"
+      class="upload-dialog"
+      aria-labelledby="uploadDialogTitle"
+    >
+      <form id="uploadForm" novalidate>
+        <div class="dialog-heading">
+          <div>
+            <span class="eyebrow">ADD TO YOUR COLLECTION</span>
+            <h2 id="uploadDialogTitle">
+              上传新片刻<span class="brand-dot">.</span>
+            </h2>
+          </div>
+          <button
+            type="button"
+            id="closeUpload"
+            class="icon-button"
+            aria-label="关闭上传弹窗"
+          >
+            <span data-icon="close"></span>
+          </button>
+        </div>
+        <div class="dialog-body">
+          <div class="user-selection">
+            <label for="uploadUser">放入谁的收藏？</label>
+            <div class="user-input-row">
+              <select id="uploadUser" required aria-label="选择用户"></select
+              ><button
+                id="toggleNewUser"
+                type="button"
+                class="button secondary"
+              >
+                <span data-icon="plus"></span>新建用户
+              </button>
+            </div>
+            <div id="newUserFields" class="new-user-fields" hidden>
+              <input
+                id="newUserName"
+                placeholder="输入用户名，例如 selena"
+                aria-label="新用户名"
+                maxlength="80"
+              /><button
+                type="button"
+                id="createUserButton"
+                class="button primary"
+              >
+                创建
+              </button>
+            </div>
+          </div>
+          <button type="button" id="dropZone" class="drop-zone">
+            <span class="upload-icon" data-icon="upload"></span
+            ><strong>拖入视频，或点击选择</strong
+            ><span>支持多选 · MP4 / WebM / MOV / M4V</span></button
+          ><input
+            type="file"
+            id="fileInput"
+            multiple
+            accept=".mp4,.webm,.mov,.m4v,video/mp4,video/webm,video/quicktime,video/x-m4v"
+            hidden
+          />
+          <div id="queueHeading" class="queue-heading" hidden>
+            <strong id="queueCount"></strong><span>确认每个视频的日期</span>
+          </div>
+          <div id="uploadQueue" class="upload-queue"></div>
+          <p id="dateHint" class="date-hint">
+            文件名中的 YYYYMMDD_ 会自动识别；没有有效日期时，默认使用今天。
+          </p>
+          <p id="uploadError" class="error-message" role="alert" hidden></p>
+          <div id="overallProgress" class="overall-progress" hidden>
+            <div class="progress-meta">
+              <span id="progressLabel">准备上传…</span
+              ><span id="progressPercent">0%</span>
+            </div>
+            <progress id="uploadProgress" value="0" max="100"></progress>
+          </div>
+        </div>
+        <div class="dialog-footer">
+          <span id="uploadFooterHint">重名文件会自动编号，已有视频会保留。</span
+          ><button
+            type="submit"
+            id="startUpload"
+            class="button primary"
+            disabled
+          >
+            <span data-icon="upload"></span
+            ><span id="uploadButtonLabel">开始上传</span>
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <noscript
+      ><div class="noscript">
+        请启用 JavaScript 以浏览和上传视频。
+      </div></noscript
+    >
+  </body>
+</html>

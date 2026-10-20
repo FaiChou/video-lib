@@ -1,0 +1,14 @@
+{
+  "name": "video-library",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "无需构建、无需第三方依赖的本地视频库",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
