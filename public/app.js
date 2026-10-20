@@ -176,7 +176,7 @@ function card(video) {
   preview.preload = "metadata";
   preview.tabIndex = -1;
   preview.setAttribute("aria-hidden", "true");
-  preview.dataset.src = video.url + "#t=0.1";
+  preview.dataset.src = video.url + "#t=1";
   const play = el("span", "thumb-play");
   play.append(icon("play"));
   const duration = el(
