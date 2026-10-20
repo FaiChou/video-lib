@@ -7,8 +7,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=video-library
-Group=video-library
+User=root
+Group=root
 WorkingDirectory=/opt/video-library
 # Change /usr/bin/node if your system-wide Node binary is elsewhere.
 ExecStart=/usr/bin/node /opt/video-library/server.mjs

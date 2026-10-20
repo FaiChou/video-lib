@@ -4,7 +4,7 @@
 
 ## Debian 部署
 
-使用已有的 Node.js 20+，按 [Debian 部署教程](DEPLOY_DEBIAN.md) 安装 `deploy/video-library.service`，即可后台运行、开机自启及异常重启。服务直接使用程序默认值，无需额外的环境配置文件。
+使用已有的 Node.js 20+，以 root 按 [Debian 部署教程](DEPLOY_DEBIAN.md) 安装 `deploy/video-library.service`，即可后台运行、开机自启及异常重启。服务使用 root 运行，直接使用程序默认值，无需创建额外的系统用户或环境配置文件。
 
 ## 手动启动
 
