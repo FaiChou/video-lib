@@ -58,6 +58,14 @@ async function upload(base, user, name, body = "video bytes", date) {
   return fetch(`${base}/api/upload?${query}`, { method: "POST", body });
 }
 
+async function setProcessed(base, video, processed, extraHeaders = {}) {
+  return fetch(`${base}/api/processed`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...extraHeaders },
+    body: JSON.stringify({ user: video.user, name: video.name, processed }),
+  });
+}
+
 test("library discovers only supported real videos, sorts by date and uses Shanghai mtime fallback", async (t) => {
   const { base, videoDir, root } = await fixture(t);
   await mkdir(path.join(videoDir, "selena"));
@@ -434,4 +442,160 @@ test("an interrupted upload removes its partial file without publishing a video"
     (await (await fetch(`${base}/api/library`)).json()).videos,
     [],
   );
+});
+
+test("processing status is shared by the library, persisted across restart, and reversible", async (t) => {
+  const { base, videoDir, publicDir, server } = await fixture(t);
+  const name = "20261020_旅行.mp4";
+  for (const user of ["小明", "selena", "processed.json"]) {
+    await createUser(base, user);
+    const uploaded = (await (await upload(base, user, name)).json()).video;
+    assert.equal(uploaded.processed, false);
+  }
+  const video = { user: "小明", name };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await setProcessed(base, video, true);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).video.processed, true);
+  }
+  const savedPath = path.join(videoDir, ".processed.json");
+  assert.deepEqual(JSON.parse(await readFile(savedPath, "utf8")), {
+    [`小明/${name}`]: true,
+  });
+
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+  const restarted = await createVideoServer({ videoDir, publicDir });
+  restarted.listen(0, "127.0.0.1");
+  await once(restarted, "listening");
+  t.after(async () => {
+    restarted.closeAllConnections();
+    await new Promise((resolve) => restarted.close(resolve));
+  });
+  const restartedBase = `http://127.0.0.1:${restarted.address().port}`;
+  const library = await (await fetch(`${restartedBase}/api/library`)).json();
+  assert.equal(library.videos.find((item) => item.user === "小明").processed, true);
+  assert.equal(
+    library.videos.find((item) => item.user === "selena").processed,
+    false,
+  );
+  assert.equal((await setProcessed(restartedBase, video, false)).status, 200);
+  const refreshed = await (await fetch(`${restartedBase}/api/library`)).json();
+  assert.ok(refreshed.videos.every((item) => item.processed === false));
+  assert.deepEqual(JSON.parse(await readFile(savedPath, "utf8")), {
+    [`小明/${name}`]: false,
+  });
+  assert.equal((await fetch(`${restartedBase}/processed.json`)).status, 404);
+});
+
+test("concurrent processing saves keep every video's latest status and leave no temporary files", async (t) => {
+  const { base, videoDir } = await fixture(t);
+  await createUser(base, "selena");
+  const videos = await Promise.all(
+    Array.from(
+      { length: 8 },
+      async (_, index) =>
+        (await (await upload(base, "selena", `20261020_${index}.mp4`)).json()).video,
+    ),
+  );
+  const marked = await Promise.all(
+    videos.map((video) => setProcessed(base, video, true)),
+  );
+  assert.ok(marked.every((response) => response.status === 200));
+  const unmarked = await Promise.all(
+    videos
+      .filter((_, index) => index % 2 === 0)
+      .map((video) => setProcessed(base, video, false)),
+  );
+  assert.ok(unmarked.every((response) => response.status === 200));
+  const expected = Object.fromEntries(
+    videos.map((video, index) => [`${video.user}/${video.name}`, index % 2 !== 0]),
+  );
+  assert.deepEqual(
+    JSON.parse(await readFile(path.join(videoDir, ".processed.json"), "utf8")),
+    expected,
+  );
+  const library = await (await fetch(`${base}/api/library`)).json();
+  for (const video of library.videos)
+    assert.equal(video.processed, expected[`${video.user}/${video.name}`]);
+  assert.deepEqual((await readdir(videoDir)).sort(), [".processed.json", "selena"]);
+});
+
+test("processing updates reject invalid values, missing videos, paths, symlinks and foreign writes", async (t) => {
+  const { base, videoDir, root } = await fixture(t);
+  await createUser(base, "selena");
+  const video = (await (await upload(base, "selena", "20261020_clip.mp4")).json())
+    .video;
+  for (const value of [undefined, null, 0, 1, "true", {}, []])
+    assert.equal((await setProcessed(base, video, value)).status, 400);
+  for (const body of ["null", "[]", "{"]) {
+    assert.equal(
+      (await fetch(`${base}/api/processed`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      })).status,
+      400,
+    );
+  }
+  for (const [user, name, status] of [
+    ["selena", "missing.mp4", 404],
+    ["missing", video.name, 404],
+    ["../outside", video.name, 400],
+    ["selena", "../secret.mp4", 400],
+    ["selena", "notes.txt", 404],
+  ]) {
+    assert.equal((await setProcessed(base, { user, name }, true)).status, status);
+  }
+  await writeFile(path.join(root, "secret.mp4"), "secret");
+  await symlink(
+    path.join(root, "secret.mp4"),
+    path.join(videoDir, "selena", "link.mp4"),
+  );
+  assert.equal(
+    (await setProcessed(base, { user: "selena", name: "link.mp4" }, true)).status,
+    404,
+  );
+  assert.equal(
+    (await setProcessed(base, video, true, { Origin: "https://foreign.example" }))
+      .status,
+    403,
+  );
+  await assert.rejects(readFile(path.join(videoDir, ".processed.json")), {
+    code: "ENOENT",
+  });
+});
+
+test("a failed processing write preserves memory and the next save can recover", async (t) => {
+  const { base, videoDir } = await fixture(t);
+  await createUser(base, "selena");
+  const video = (await (await upload(base, "selena", "20261020_clip.mp4")).json())
+    .video;
+  const savedPath = path.join(videoDir, ".processed.json");
+  await mkdir(savedPath); // Force the final rename to fail on any platform.
+  const errors = t.mock.method(console, "error", () => {});
+  assert.equal((await setProcessed(base, video, true)).status, 500);
+  assert.equal(errors.mock.callCount(), 1);
+  const library = await (await fetch(`${base}/api/library`)).json();
+  assert.equal(library.videos[0].processed, false);
+  assert.deepEqual((await readdir(videoDir)).sort(), [".processed.json", "selena"]);
+  await rm(savedPath, { recursive: true });
+  assert.equal((await setProcessed(base, video, true)).status, 200);
+  assert.equal(
+    JSON.parse(await readFile(savedPath, "utf8"))[`selena/${video.name}`],
+    true,
+  );
+});
+
+test("invalid saved processing data fails startup without overwriting the file", async (t) => {
+  const { videoDir, publicDir } = await fixture(t);
+  const savedPath = path.join(videoDir, ".processed.json");
+  for (const content of ["{broken", "null", "[]", '{"selena/clip.mp4":"true"}']) {
+    await writeFile(savedPath, content);
+    await assert.rejects(
+      createVideoServer({ videoDir, publicDir }),
+      /无法读取处理状态/,
+    );
+    assert.equal(await readFile(savedPath, "utf8"), content);
+  }
 });

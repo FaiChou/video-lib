@@ -9,6 +9,8 @@ import {
   open,
   link,
   unlink,
+  readFile,
+  rename,
 } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -194,6 +196,24 @@ export async function createVideoServer(options = {}) {
   );
   await mkdir(requestedVideoDir, { recursive: true });
   const videoDir = await realpath(requestedVideoDir);
+  const processedPath = path.join(videoDir, ".processed.json");
+  let processedVideos = {};
+  try {
+    const saved = JSON.parse(await readFile(processedPath, "utf8"));
+    if (
+      !saved ||
+      typeof saved !== "object" ||
+      Array.isArray(saved) ||
+      Object.values(saved).some((value) => typeof value !== "boolean")
+    ) {
+      throw new Error("内容必须是以视频路径为键、布尔值为状态的 JSON 对象。");
+    }
+    processedVideos = saved;
+  } catch (error) {
+    if (error.code !== "ENOENT")
+      throw new Error(`无法读取处理状态 ${processedPath}：${error.message}`);
+  }
+  let processedWrite = Promise.resolve();
 
   async function userFolder(user, create = false) {
     safeSegment(user, "用户名");
@@ -230,6 +250,7 @@ export async function createVideoServer(options = {}) {
       date: fromName || localDate(info.mtime),
       dateSource: fromName ? "filename" : "modified",
       size: info.size,
+      processed: processedVideos[`${user}/${name}`] === true,
       url,
       downloadUrl: `${url}?download=1`,
     };
@@ -281,6 +302,52 @@ export async function createVideoServer(options = {}) {
         a.name.localeCompare(b.name, "zh-CN", { numeric: true }),
     );
     return { users, videos, today: localDate(), timeZone, maxUploadBytes };
+  }
+
+  async function setProcessed(req) {
+    const body = await readJson(req);
+    const user = safeSegment(body?.user, "用户名");
+    const name = safeSegment(body?.name);
+    if (typeof body?.processed !== "boolean")
+      throw new HttpError(400, "处理状态必须是布尔值。");
+    if (!VIDEO_TYPES.has(path.extname(name).toLowerCase()))
+      throw new HttpError(404, "视频不存在。");
+    const folder = await userFolder(user);
+    let info;
+    try {
+      info = await lstat(path.join(folder, name));
+    } catch (error) {
+      if (error.code === "ENOENT") throw new HttpError(404, "视频不存在。");
+      throw error;
+    }
+    if (!info.isFile() || info.isSymbolicLink())
+      throw new HttpError(404, "视频不存在。");
+
+    // Serialize read/modify/write operations so concurrent clicks cannot lose
+    // another video's status. Publish memory only after the atomic file replace.
+    const write = processedWrite.then(async () => {
+      const next = { ...processedVideos, [`${user}/${name}`]: body.processed };
+      const tempPath = path.join(videoDir, `.processed-${randomUUID()}.tmp`);
+      let handle;
+      try {
+        handle = await open(tempPath, "wx", 0o600);
+        await handle.writeFile(JSON.stringify(next, null, 2) + "\n");
+        await handle.sync();
+        await handle.close();
+        handle = null;
+        await rename(tempPath, processedPath);
+        processedVideos = next;
+      } finally {
+        if (handle) await handle.close().catch(() => {});
+        await unlink(tempPath).catch((error) => {
+          if (error.code !== "ENOENT")
+            console.error("处理状态临时文件清理失败:", error.message);
+        });
+      }
+      return { video: videoMetadata(user, name, info) };
+    });
+    processedWrite = write.catch(() => {});
+    return write;
   }
 
   async function upload(req, url) {
@@ -508,6 +575,10 @@ export async function createVideoServer(options = {}) {
       }
       if (url.pathname === "/api/upload" && req.method === "POST") {
         json(res, 201, await upload(req, url));
+        return;
+      }
+      if (url.pathname === "/api/processed" && req.method === "POST") {
+        json(res, 200, await setProcessed(req));
         return;
       }
       if (

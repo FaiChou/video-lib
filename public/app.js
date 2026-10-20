@@ -61,6 +61,9 @@ let loadGeneration = 0,
   uploading = false,
   toastTimer,
   thumbnails;
+const pendingProcessed = new Set();
+const processedChanges = new Map();
+let processedRevision = 0;
 const palette = [
   ["#f0e8f7", "#9e7cb7"],
   ["#e5f0eb", "#719e87"],
@@ -84,6 +87,8 @@ function formatSize(n) {
 }
 function showToast(message) {
   clearTimeout(toastTimer);
+  // Dialogs live above the document; put feedback in the active top layer.
+  (document.querySelector("dialog[open]") || document.body).append($("toast"));
   $("toast").textContent = message;
   $("toast").hidden = false;
   toastTimer = setTimeout(() => {
@@ -164,6 +169,66 @@ function clearThumbs() {
       video.load();
     });
 }
+function updateProcessedToggle(toggle, video) {
+  const pending = pendingProcessed.has(video.id);
+  toggle.setAttribute("aria-checked", String(video.processed));
+  toggle.setAttribute("aria-label", `${video.user}/${video.name} 已处理`);
+  toggle.setAttribute("aria-busy", String(pending));
+  toggle.disabled = pending;
+  toggle.title = video.processed ? "标记为未处理" : "标记为已处理";
+  toggle.querySelector(".processed-label").textContent = pending
+    ? "保存中…"
+    : video.processed
+      ? "已处理"
+      : "未处理";
+}
+function syncProcessedToggles(video) {
+  document.querySelectorAll(".processed-toggle").forEach((toggle) => {
+    if (toggle.dataset.videoId === video.id) updateProcessedToggle(toggle, video);
+  });
+}
+function processedToggle(video) {
+  const toggle = button("", "processed-toggle", () => toggleProcessed(video));
+  toggle.dataset.videoId = video.id;
+  toggle.setAttribute("role", "switch");
+  const track = el("span", "processed-track");
+  track.setAttribute("aria-hidden", "true");
+  toggle.append(track, el("span", "processed-label"));
+  updateProcessedToggle(toggle, video);
+  return toggle;
+}
+async function toggleProcessed(original) {
+  if (pendingProcessed.has(original.id)) return;
+  const video = state.videos.find((item) => item.id === original.id) || original;
+  pendingProcessed.add(video.id);
+  syncProcessedToggles(video);
+  try {
+    const data = await api("/api/processed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user: video.user,
+        name: video.name,
+        processed: !video.processed,
+      }),
+    });
+    video.processed = data.video.processed;
+    original.processed = video.processed;
+    processedChanges.set(video.id, {
+      processed: video.processed,
+      revision: ++processedRevision,
+    });
+    const current = state.videos.find((item) => item.id === video.id);
+    if (current) current.processed = video.processed;
+  } catch (error) {
+    showToast(`处理状态保存失败：${error.message}`);
+  } finally {
+    pendingProcessed.delete(video.id);
+    syncProcessedToggles(
+      state.videos.find((item) => item.id === video.id) || video,
+    );
+  }
+}
 function card(video) {
   const article = el("article", "video-card");
   const thumb = button("", "thumbnail", () => openPlayer(video));
@@ -225,7 +290,9 @@ function card(video) {
     button("播放", "card-action", () => openPlayer(video), "play"),
     download,
   );
-  article.append(thumb, info, footer);
+  const thumbnailWrap = el("div", "thumbnail-wrap");
+  thumbnailWrap.append(thumb, processedToggle(video));
+  article.append(thumbnailWrap, info, footer);
   return article;
 }
 function renderEmpty(mode, message) {
@@ -381,12 +448,18 @@ function updateUserOptions() {
 }
 async function loadLibrary({ notify = false } = {}) {
   const generation = ++loadGeneration;
+  const revision = processedRevision;
   $("refreshButton").disabled = true;
   $("refreshButton").classList.add("spinning");
   try {
     const data = await api("/api/library");
     if (generation !== loadGeneration) return;
-    state.videos = data.videos;
+    state.videos = data.videos.map((video) => {
+      // A refresh started before a successful save must not restore old status.
+      const change = processedChanges.get(video.id);
+      if (change && change.revision > revision) video.processed = change.processed;
+      return video;
+    });
     state.users = data.users;
     state.today = data.today;
     state.timeZone = data.timeZone || "Asia/Shanghai";
@@ -398,6 +471,12 @@ async function loadLibrary({ notify = false } = {}) {
       ),
     );
     renderLibrary();
+    const playerToggle =
+      $("playerProcessedControl").querySelector(".processed-toggle");
+    const playerVideo = state.videos.find(
+      (video) => video.id === playerToggle?.dataset.videoId,
+    );
+    if (playerVideo) updateProcessedToggle(playerToggle, playerVideo);
     updateUserOptions();
     if (notify) showToast("视频库已刷新");
   } catch (error) {
@@ -424,6 +503,8 @@ function route() {
   document.title = upload ? "上传视频 · 片刻" : "片刻 · 视频收藏";
 }
 function openPlayer(video) {
+  video = state.videos.find((item) => item.id === video.id) || video;
+  $("playerProcessedControl").replaceChildren(processedToggle(video));
   $("playerTitle").textContent = video.name;
   $("playerMeta").textContent =
     `${video.user} · ${video.date} · ${formatSize(video.size)}`;
