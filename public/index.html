@@ -75,6 +75,19 @@
             <span id="resultSummary" role="status" aria-live="polite"
               >正在读取视频…</span
             >
+            <div
+              id="gridLayoutSwitch"
+              class="grid-layout-switch"
+              role="group"
+              aria-label="每行最多展示的视频数"
+            >
+              <button type="button" data-columns="4" aria-pressed="false">
+                一行 4 个
+              </button>
+              <button type="button" data-columns="6" aria-pressed="true">
+                一行 6 个
+              </button>
+            </div>
           </div>
           <div id="videoGrid" class="video-grid" aria-label="视频列表"></div>
           <div id="emptyState" class="empty-state" hidden></div>

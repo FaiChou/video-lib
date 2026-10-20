@@ -53,6 +53,7 @@ const state = {
   pageSize: pageSizes.includes(Number(params.get("size")))
     ? Number(params.get("size"))
     : 48,
+  maxColumns: params.get("columns") === "4" ? 4 : 6,
   today: "",
   timeZone: "Asia/Shanghai",
   maxUploadBytes: 2 * 1024 ** 3,
@@ -112,12 +113,24 @@ function syncURL() {
   if (state.sort !== "desc") p.set("sort", state.sort);
   if (state.page > 1) p.set("page", state.page);
   if (state.pageSize !== 48) p.set("size", state.pageSize);
+  if (state.maxColumns !== 6) p.set("columns", state.maxColumns);
   const query = p.toString();
   history.replaceState(
     null,
     "",
     `${location.pathname}${query ? "?" + query : ""}${location.hash}`,
   );
+}
+function renderGridLayout() {
+  $("videoGrid").dataset.maxColumns = String(state.maxColumns);
+  $("gridLayoutSwitch")
+    .querySelectorAll("button")
+    .forEach((toggle) => {
+      toggle.setAttribute(
+        "aria-pressed",
+        String(Number(toggle.dataset.columns) === state.maxColumns),
+      );
+    });
 }
 function renderFilters() {
   const all = button("全部用户", "filter-chip", () => {
@@ -906,6 +919,16 @@ $("searchInput").value = state.search;
 $("hideProcessed").checked = state.hideProcessed;
 $("sortSelect").value = state.sort;
 $("pageSizeSelect").value = String(state.pageSize);
+renderGridLayout();
+$("gridLayoutSwitch")
+  .querySelectorAll("button")
+  .forEach((toggle) => {
+    toggle.addEventListener("click", () => {
+      state.maxColumns = Number(toggle.dataset.columns);
+      renderGridLayout();
+      syncURL();
+    });
+  });
 $("searchInput").addEventListener("input", () => {
   state.search = $("searchInput").value.trim();
   state.page = 1;
