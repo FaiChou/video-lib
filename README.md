@@ -4,7 +4,7 @@
 
 ## Debian 部署
 
-使用已有的 Node.js 20+，按 [Debian 部署教程](DEPLOY_DEBIAN.md) 安装 systemd 服务，即可后台运行、开机自启及异常重启。配置文件位于 `deploy/video-library.service` 和 `deploy/video-library.env.example`。
+使用已有的 Node.js 20+，按 [Debian 部署教程](DEPLOY_DEBIAN.md) 安装 `deploy/video-library.service`，即可后台运行、开机自启及异常重启。服务直接使用程序默认值，无需额外的环境配置文件。
 
 ## 手动启动
 
@@ -14,7 +14,7 @@
 node server.mjs
 ```
 
-打开 **http://127.0.0.1:8876**。按 `Ctrl+C` 停止服务。
+本机打开 **http://127.0.0.1:8876**；在局域网中的其他设备上，打开 **http://nuc8.local:8876** 或使用服务器的局域网 IPv4 地址。按 `Ctrl+C` 停止服务。
 
 也可以运行 `npm start`，不需要先执行 `npm install`。
 
@@ -35,8 +35,7 @@ video-library/
 │   └── granada/
 │       └── 20260816_旅行.mp4
 ├── deploy/
-│   ├── video-library.service
-│   └── video-library.env.example
+│   └── video-library.service
 ├── DEPLOY_DEBIAN.md
 └── README.md
 ```
@@ -76,27 +75,20 @@ video-library/
 
 日期前缀格式为 `YYYYMMDD_`，默认时区是 `Asia/Shanghai`。直接复制到素材目录的旧文件若没有有效日期前缀，按文件修改日期展示，不修改文件名；通过上传弹窗提交的新文件会自动补齐日期。
 
-## 配置
+## 默认配置
 
-默认只在本机 `127.0.0.1` 上运行。可以通过环境变量修改配置，不需要更改源码。
+直接启动即可，无需创建或加载环境配置文件。
 
-```sh
-# 端口已占用时换一个端口
-PORT=9000 node server.mjs
+| 项目 | 默认值 |
+| ---- | ------ |
+| 监听地址 | `0.0.0.0`（所有 IPv4 网卡） |
+| 端口 | `8876` |
+| 允许访问的地址 | `nuc8.local`、本机地址和服务器网卡 IP |
+| 素材目录 | 项目目录下的 `videos/` |
+| 日期时区 | `Asia/Shanghai` |
+| 单文件上传上限 | 2 GiB（2147483648 字节） |
 
-# 使用其他素材目录（绝对路径）
-VIDEO_DIR="/path/to/your/videos" node server.mjs
-
-# 将单文件上传上限改为 500 MiB
-MAX_UPLOAD_BYTES=524288000 node server.mjs
-
-# 更改日期使用的时区
-TZ=Asia/Shanghai node server.mjs
-```
-
-需要在可信局域网使用时，可以设置 `HOST=0.0.0.0`，通过这台电脑的局域网 IP 访问。当前版本没有登录鉴权，能访问的人都能浏览、下载和上传。
-
-通过公网 IP 或域名直接访问时，可以设置 `ALLOWED_HOSTS=公网IP,域名`。填写主机名或 IP，不带协议、端口或路径；详细示例见部署教程。
+部署在局域网中的 Debian 服务器后，可直接访问 **http://nuc8.local:8876**，无需额外配置。若服务器启用了防火墙，需允许局域网访问 TCP 8876 端口。当前版本没有登录鉴权，能访问的人都能浏览、下载和上传。
 
 ## 格式兼容
 
@@ -110,7 +102,7 @@ TZ=Asia/Shanghai node server.mjs
 - `public/app.js`：筛选、排序、分页、播放和上传交互。
 - `videos/`：实际素材，用户名作为子目录。
 - `tests/server.test.mjs`：接口集成测试。
-- `deploy/`：Debian systemd 服务和环境配置模板。
+- `deploy/`：Debian systemd 服务文件。
 - `DEPLOY_DEBIAN.md`：安装、开机自启、日志和升级教程。
 
 运行 `npm test` 可检查日期处理、同名保护、视频范围请求、下载、目录隔离、上传限制和中断清理。测试只使用临时目录。

@@ -263,6 +263,52 @@ test("declared and streamed upload limits reject oversize files and clean partia
   assert.deepEqual(await readdir(path.join(videoDir, "selena")), []);
 });
 
+test("default LAN access allows nuc8.local and interface IPs while checking ports and origins", async (t) => {
+  const { base, server } = await fixture(t);
+  const port = server.address().port;
+  async function request(authority, method = "GET", origin) {
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        `${base}${method === "POST" ? "/api/users" : "/api/library"}`,
+        {
+          method,
+          headers: {
+            Host: authority,
+            ...(origin ? { Origin: origin } : {}),
+            "Content-Type": "application/json",
+          },
+        },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode));
+        },
+      );
+      req.on("error", reject);
+      req.end(method === "POST" ? JSON.stringify({ name: "lan-user" }) : undefined);
+    });
+  }
+  assert.equal(await request(`nuc8.local:${port}`), 200);
+  assert.equal(await request(`NUC8.LOCAL:${port}`), 200);
+  for (const interfaces of Object.values(os.networkInterfaces())) {
+    for (const { address, family } of interfaces || []) {
+      if (family === "IPv4")
+        assert.equal(await request(`${address}:${port}`), 200, address);
+    }
+  }
+  assert.equal(
+    await request(`nuc8.local:${port}`, "POST", `http://nuc8.local:${port}`),
+    201,
+  );
+  assert.equal(
+    await request(`nuc8.local:${port}`, "POST", `http://foreign.local:${port}`),
+    403,
+  );
+  for (const hostname of ["foreign.local", "sub.nuc8.local", "nuc8.local.example"]) {
+    assert.equal(await request(`${hostname}:${port}`), 403, hostname);
+  }
+  assert.equal(await request(`nuc8.local:${port === 8876 ? 8877 : 8876}`), 403);
+});
+
 test("configured public hosts allow matching origins without relaxing port or origin checks", async (t) => {
   const { base, server } = await fixture(t, {
     allowedHosts: " Videos.Example, 203.0.113.10, 2001:0db8:0:0:0:0:0:42 ",

@@ -10,7 +10,6 @@ Type=simple
 User=video-library
 Group=video-library
 WorkingDirectory=/opt/video-library
-EnvironmentFile=/etc/default/video-library
 # Change /usr/bin/node if your system-wide Node binary is elsewhere.
 ExecStart=/usr/bin/node /opt/video-library/server.mjs
 Restart=on-failure

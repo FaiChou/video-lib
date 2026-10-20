@@ -18,6 +18,7 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 const PROJECT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_HOST = "0.0.0.0";
 const MAX_LIMIT = 2 * 1024 * 1024 * 1024;
 const VIDEO_TYPES = new Map([
   [".mp4", "video/mp4"],
@@ -156,9 +157,9 @@ function parseAllowedHosts(value) {
 
 /** Creates an HTTP server without listening; usable directly from tests. */
 export async function createVideoServer(options = {}) {
-  const host = options.host ?? process.env.HOST ?? "127.0.0.1";
+  const host = options.host ?? process.env.HOST ?? DEFAULT_HOST;
   const additionalHosts = parseAllowedHosts(
-    options.allowedHosts ?? process.env.ALLOWED_HOSTS ?? "",
+    options.allowedHosts ?? process.env.ALLOWED_HOSTS ?? "nuc8.local",
   );
   const timeZone = options.timeZone ?? process.env.TZ ?? "Asia/Shanghai";
   const maxUploadBytes = Number(
@@ -586,7 +587,7 @@ if (
   process.argv[1] &&
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
-  const host = process.env.HOST || "127.0.0.1";
+  const host = process.env.HOST || DEFAULT_HOST;
   const port = Number(process.env.PORT || 8876);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     console.error("PORT 必须是 1 到 65535 之间的整数。");
