@@ -305,14 +305,13 @@ function card(video) {
   download.download = video.name;
   download.setAttribute("aria-label", `下载 ${video.name}`);
   download.append(icon("download"), document.createTextNode("下载"));
-  footer.append(
+  const actions = el("div", "card-footer-actions");
+  actions.append(
     el("span", "file-size", formatSize(video.size)),
-    button("播放", "card-action", () => openPlayer(video), "play"),
     download,
   );
-  const thumbnailWrap = el("div", "thumbnail-wrap");
-  thumbnailWrap.append(thumb, processedToggle(video));
-  article.append(thumbnailWrap, info, footer);
+  footer.append(processedToggle(video), actions);
+  article.append(thumb, info, footer);
   return article;
 }
 function renderEmpty(mode, message) {

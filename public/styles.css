@@ -430,9 +430,6 @@ input::placeholder {
   transform: translateY(-3px);
   box-shadow: 0 8px 24px #53556b0c;
 }
-.thumbnail-wrap {
-  position: relative;
-}
 .processed-toggle {
   display: inline-flex;
   align-items: center;
@@ -491,27 +488,23 @@ input::placeholder {
 .processed-toggle[aria-checked="true"] .processed-track::after {
   transform: translateX(10px);
 }
-.thumbnail-wrap > .processed-toggle {
-  position: absolute;
-  top: 7px;
-  right: 7px;
-  z-index: 2;
+.card-footer > .processed-toggle {
+  flex: none;
   gap: 5px;
   min-height: 26px;
   padding: 4px 7px;
   border-radius: 6px;
   font-size: 10px;
-  box-shadow: 0 2px 8px #18202b1a;
 }
-.thumbnail-wrap > .processed-toggle .processed-track {
+.card-footer > .processed-toggle .processed-track {
   width: 22px;
   height: 14px;
 }
-.thumbnail-wrap > .processed-toggle .processed-track::after {
+.card-footer > .processed-toggle .processed-track::after {
   width: 8px;
   height: 8px;
 }
-.thumbnail-wrap > .processed-toggle[aria-checked="true"] .processed-track::after {
+.card-footer > .processed-toggle[aria-checked="true"] .processed-track::after {
   transform: translateX(8px);
 }
 .player-footer .processed-toggle {
@@ -656,16 +649,28 @@ input::placeholder {
   margin: 0 12px;
   padding: 8px 0;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+}
+.card-footer-actions {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px 6px;
+  min-width: min-content;
+  margin-left: auto;
 }
 .file-size {
   font-size: 9px;
   color: #aaa7b3;
-  margin-right: auto;
+  white-space: nowrap;
 }
 .card-action {
   display: inline-flex;
+  flex: none;
   align-items: center;
   gap: 3px;
   color: #8c8796;
@@ -1391,20 +1396,12 @@ dialog::backdrop {
   }
   .card-footer {
     margin: 0 8px;
-    gap: 8px;
-    flex-wrap: wrap;
   }
   .file-size {
-    width: 100%;
-    margin: 0;
     font-size: 8px;
-    display: none;
   }
   .card-action {
     font-size: 9px;
-  }
-  .card-action:first-of-type {
-    margin-right: auto;
   }
   .pagination-bar {
     flex-wrap: wrap;
