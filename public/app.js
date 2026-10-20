@@ -46,6 +46,7 @@ const state = {
   users: [],
   selected: new Set(params.getAll("user")),
   search: params.get("q") || "",
+  hideProcessed: params.get("hideProcessed") === "1",
   sort: params.get("sort") === "asc" ? "asc" : "desc",
   page: Math.max(1, Number(params.get("page")) || 1),
   pageSize: [50, 100, 200, 500].includes(Number(params.get("size")))
@@ -106,6 +107,7 @@ function syncURL() {
   const p = new URLSearchParams();
   [...state.selected].forEach((name) => p.append("user", name));
   if (state.search) p.set("q", state.search);
+  if (state.hideProcessed) p.set("hideProcessed", "1");
   if (state.sort !== "desc") p.set("sort", state.sort);
   if (state.page > 1) p.set("page", state.page);
   if (state.pageSize !== 100) p.set("size", state.pageSize);
@@ -149,6 +151,7 @@ function filteredVideos() {
     .filter(
       (v) =>
         (!state.selected.size || state.selected.has(v.user)) &&
+        (!state.hideProcessed || !v.processed) &&
         v.name.toLocaleLowerCase().includes(state.search.toLocaleLowerCase()),
     )
     .sort((a, b) => {
@@ -200,6 +203,7 @@ function processedToggle(video) {
 async function toggleProcessed(original) {
   if (pendingProcessed.has(original.id)) return;
   const video = state.videos.find((item) => item.id === original.id) || original;
+  let saved = false;
   pendingProcessed.add(video.id);
   syncProcessedToggles(video);
   try {
@@ -220,6 +224,7 @@ async function toggleProcessed(original) {
     });
     const current = state.videos.find((item) => item.id === video.id);
     if (current) current.processed = video.processed;
+    saved = true;
   } catch (error) {
     showToast(`处理状态保存失败：${error.message}`);
   } finally {
@@ -227,6 +232,7 @@ async function toggleProcessed(original) {
     syncProcessedToggles(
       state.videos.find((item) => item.id === video.id) || video,
     );
+    if (saved && state.hideProcessed) renderLibrary();
   }
 }
 function card(video) {
@@ -311,7 +317,9 @@ function renderEmpty(mode, message) {
   const detail = el("p");
   if (mode === "error") detail.textContent = message;
   else if (mode === "filtered")
-    detail.textContent = "换个关键词，或者试试其他用户。";
+    detail.textContent = state.hideProcessed
+      ? "已隐藏处理过的视频，试试关闭「隐藏已处理」或调整其他筛选条件。"
+      : "换个关键词，或者试试其他用户。";
   else
     detail.append(
       "上传一些视频，或将用户文件夹放入 ",
@@ -331,6 +339,7 @@ function renderEmpty(mode, message) {
         ? () => {
             state.selected.clear();
             state.search = "";
+            state.hideProcessed = false;
             $("searchInput").value = "";
             state.page = 1;
             renderLibrary();
@@ -387,14 +396,14 @@ function renderPagination(total, pages) {
 }
 function renderLibrary() {
   renderFilters();
+  $("hideProcessed").checked = state.hideProcessed;
   const videos = filteredVideos();
   const pages = Math.max(1, Math.ceil(videos.length / state.pageSize));
   state.page = Math.min(Math.max(1, Math.floor(state.page)), pages);
   const start = (state.page - 1) * state.pageSize;
   $("totalCount").textContent = String(state.videos.length);
-  $("collectionTitle").textContent = state.selected.size
-    ? "筛选片刻"
-    : "全部片刻";
+  $("collectionTitle").textContent =
+    state.selected.size || state.hideProcessed ? "筛选片刻" : "全部片刻";
   $("resultSummary").textContent = videos.length
     ? `共 ${videos.length} 个视频 · 正在展示 ${start + 1}–${Math.min(start + state.pageSize, videos.length)} 个`
     : "共 0 个视频";
@@ -405,7 +414,10 @@ function renderLibrary() {
   $("emptyState").hidden = !!videos.length;
   if (!videos.length)
     renderEmpty(
-      state.videos.length || state.selected.size || state.search
+      state.videos.length ||
+        state.selected.size ||
+        state.search ||
+        state.hideProcessed
         ? "filtered"
         : "empty",
     );
@@ -890,10 +902,16 @@ window.addEventListener("beforeunload", (e) => {
   }
 });
 $("searchInput").value = state.search;
+$("hideProcessed").checked = state.hideProcessed;
 $("sortSelect").value = state.sort;
 $("pageSizeSelect").value = String(state.pageSize);
 $("searchInput").addEventListener("input", () => {
   state.search = $("searchInput").value.trim();
+  state.page = 1;
+  renderLibrary();
+});
+$("hideProcessed").addEventListener("change", () => {
+  state.hideProcessed = $("hideProcessed").checked;
   state.page = 1;
   renderLibrary();
 });

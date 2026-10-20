@@ -259,6 +259,7 @@ h2 {
 }
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   justify-content: space-between;
@@ -294,8 +295,38 @@ input::placeholder {
 }
 .toolbar-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   align-items: center;
+}
+.processed-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  color: #737380;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.processed-filter:hover {
+  border-color: #f2bac9;
+}
+.processed-filter:has(input:checked) {
+  border-color: #ffd4df;
+  background: var(--pink-light);
+  color: var(--pink-dark);
+}
+.processed-filter input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--pink-dark);
+  cursor: pointer;
 }
 .sort-control {
   display: flex;
