@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +22,31 @@ import { normalizeVideo } from "../media-converter.mjs";
 // These 0.5-second fixtures are synthetic test patterns and a 440 Hz tone.
 // Tests exercise actual codecs; ffmpeg is not needed to run this suite.
 const fixtures = fileURLToPath(new URL("./fixtures/", import.meta.url));
+
+test("a fresh process converts VP9 without probing GPU drivers for decoding or encoding", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "video-software-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const outputPath = path.join(directory, "output.mp4");
+  // A fresh process prevents an earlier conversion's cached hardware context
+  // from hiding accidental GPU probes on a headless server.
+  await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `
+    import { HardwareContext } from 'node-av';
+    import { open } from 'node:fs/promises';
+    HardwareContext.auto = () => { throw new Error('GPU probing is unavailable'); };
+    const { normalizeVideo } = await import('./media-converter.mjs');
+    const handle = await open(process.argv[1], 'r');
+    try {
+      const result = await normalizeVideo({ handle, outputPath: process.argv[2] });
+      if (!result.converted) throw new Error('Expected VP9 to be converted');
+    } finally {
+      await handle.close();
+    }
+  `, path.join(fixtures, "vp9-opus.webm"), outputPath], {
+    cwd: fileURLToPath(new URL("../", import.meta.url)),
+    timeout: 30000,
+  });
+  await assertMedia(t, outputPath, {});
+});
 
 async function fixture(t, name) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "video-conversion-"));

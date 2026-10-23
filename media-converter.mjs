@@ -15,7 +15,10 @@ import {
 } from "mediabunny";
 import { registerMediabunnyServer } from "@mediabunny/server";
 
-registerMediabunnyServer();
+// Hardware auto-detection can crash the native runtime on headless servers with
+// incomplete GPU drivers. Disable it for both decoding and encoding, not just
+// the output encoder, so conversion works without CUDA/VAAPI dependencies.
+registerMediabunnyServer({ hardwareContext: null });
 
 // The caller owns handle and must keep it open until this promise settles.
 // outputPath must be a fresh temporary path, separate from the input file.

@@ -49,7 +49,7 @@ npm ci
 
 请保留 `package-lock.json`。`npm ci` 会安装锁定版本的 `mediabunny` 和 `@mediabunny/server`；后者依赖 NodeAV 的原生编解码器，安装时按服务器平台下载预编译依赖及附带工具，需要联网。无需手动安装或调用 FFmpeg 命令。不要从 macOS、Windows 或其他架构复制 `node_modules/`，也不要省略平台相关的可选依赖或跳过安装脚本。
 
-转换任务由服务器执行，客户端仍可通过局域网 HTTP 使用，无需 HTTPS 或浏览器 WebCodecs。首次部署后可以运行 `npm test`，验证真实视频编码转换及接口行为。
+转换任务由服务器执行，使用 CPU 软件编解码，关闭 GPU 自动探测，无需 CUDA 或 VAAPI 驱动。客户端仍可通过局域网 HTTP 使用，无需 HTTPS 或浏览器 WebCodecs。首次部署后可以运行 `npm test`，验证真实视频编码转换及接口行为。
 
 然后统一设置权限：
 
@@ -252,6 +252,8 @@ chmod -R u=rwX,g=rX,o= /opt/video-library/videos
 | `ERR_MODULE_NOT_FOUND` / 缺少原生模块 | 确认在服务器运行过 `npm ci`，保留锁文件、平台可选依赖与安装脚本；不要复制其他平台的 `node_modules/`。 |
 | 安装依赖下载失败             | 检查服务器访问 npm 和依赖下载地址的网络，修复后重新运行 `npm ci`。 |
 | 转换失败或等待时间较长       | 查看网页错误与 `journalctl` 日志，检查磁盘空间；转换任务串行执行，已有任务未完成时后续任务会等待。旧素材可以下载原文件。 |
+| 下载提示「接口不存在」       | 新页面可能仍连接旧 Node 进程；确认更新了服务端代码、执行 `npm ci` 并重启 `video-library`，再刷新页面。 |
+| 转码时出现 `status=11/SEGV`   | 若崩溃前有 CUDA/VAAPI 探测错误，更新 `media-converter.mjs` 并重启；新版明确关闭编解码器硬件探测，使用软件转换。 |
 | `EADDRINUSE`                  | 服务器的 8876 端口被占用，停止占用该端口的进程后重新启动服务。                                                        |
 | `EACCES` / 上传提示服务器错误 | 检查视频目录的所有者和读写权限，并查看 `journalctl` 日志。                                                              |
 | `此 Host 不允许访问`          | 使用 `http://nuc8.local:8876` 或服务器的局域网 IPv4 地址，确认已安装新版 `server.mjs` 并重启服务。                       |
