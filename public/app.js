@@ -71,6 +71,7 @@ let activeDownload = null,
   downloadPollTimer,
   downloadPollController,
   downloadGeneration = 0,
+  downloadDialogGeneration = 0,
   autoStartDownload = false;
 let processedRevision = 0;
 const palette = [
@@ -94,7 +95,7 @@ function formatSize(n) {
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
   return `${(n / 1024 ** 3).toFixed(2)} GB`;
 }
-function showToast(message) {
+function showToast(message, duration = 4000) {
   clearTimeout(toastTimer);
   // Dialogs live above the document; put feedback in the active top layer.
   (document.querySelector("dialog[open]") || document.body).append($("toast"));
@@ -102,7 +103,7 @@ function showToast(message) {
   $("toast").hidden = false;
   toastTimer = setTimeout(() => {
     $("toast").hidden = true;
-  }, 4000);
+  }, duration);
 }
 async function api(url, options) {
   const response = await fetch(url, { cache: "no-store", ...options });
@@ -579,17 +580,24 @@ function closeOnBackdrop(dialog, callback) {
 closeOnBackdrop($("playerDialog"), () => $("playerDialog").close());
 function updateDownloadButton(control, video) {
   const entry = downloads.get(video.id);
+  const checking = entry?.requesting;
   const busy =
-    entry?.requesting || ["queued", "processing"].includes(entry?.job?.status);
+    checking || ["queued", "processing"].includes(entry?.job?.status);
   control.setAttribute("aria-busy", String(!!busy));
   control.setAttribute(
     "aria-label",
-    `${busy ? "查看下载进度" : "下载 H.264 MP4"}：${video.name}`,
+    `${checking ? "正在检查下载格式" : busy ? "查看下载进度" : "下载 H.264 MP4"}：${video.name}`,
   );
-  control.title = busy ? "点击查看下载准备进度" : "下载 H.264 编码的 MP4";
-  control.querySelector(".download-label").textContent = busy
-    ? "查看进度"
-    : "下载";
+  control.title = checking
+    ? "正在检查下载格式"
+    : busy
+      ? "点击查看下载准备进度"
+      : "下载 H.264 编码的 MP4";
+  control.querySelector(".download-label").textContent = checking
+    ? "检查中…"
+    : busy
+      ? "查看进度"
+      : "下载";
 }
 function syncDownloadButtons(entry) {
   document.querySelectorAll(".download-action").forEach((control) => {
@@ -606,6 +614,7 @@ function stopDownloadPolling() {
 function renderDownload(entry) {
   syncDownloadButtons(entry);
   if (entry !== activeDownload || !$("downloadDialog").open) return;
+  downloadDialogGeneration = downloadGeneration;
   const job = entry.job;
   const ready = job?.status === "ready";
   const failed = job?.status === "failed";
@@ -658,14 +667,28 @@ function updateDownloadJob(entry, job) {
 }
 function continueDownload(entry) {
   renderDownload(entry);
-  if (entry !== activeDownload || !$("downloadDialog").open) return;
-  if (entry.job?.status === "ready") {
+  if (entry !== activeDownload) return;
+  if (entry.job?.status === "ready" && !entry.error) {
     if (autoStartDownload) {
       autoStartDownload = false;
       // A normal link streams the download without buffering the video in memory.
-      $("readyDownload").click();
+      const link = el("a");
+      link.href = entry.job.downloadUrl;
+      link.download = entry.job.name;
+      link.hidden = true;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      showToast("已发起下载，未开始时可", 10000);
+      const retry = el("a", "toast-download", "点击重试");
+      retry.href = entry.job.downloadUrl;
+      retry.download = entry.job.name;
+      $("toast").append(retry);
     }
-  } else if (
+    return;
+  }
+  showDownloadDialog(entry);
+  if (
     ["queued", "processing"].includes(entry.job?.status) &&
     !entry.error
   ) {
@@ -716,6 +739,12 @@ async function refreshDownload(entry) {
     if (downloadPollController === controller) downloadPollController = null;
   }
 }
+function showDownloadDialog(entry) {
+  if (entry !== activeDownload) return;
+  if ($("playerDialog").open) $("playerDialog").close();
+  if (!$("downloadDialog").open) $("downloadDialog").showModal();
+  renderDownload(entry);
+}
 function openDownload(video) {
   stopDownloadPolling();
   let entry = downloads.get(video.id);
@@ -726,17 +755,22 @@ function openDownload(video) {
   entry.video = video;
   activeDownload = entry;
   autoStartDownload = true;
-  if ($("playerDialog").open) $("playerDialog").close();
-  if (!$("downloadDialog").open) $("downloadDialog").showModal();
-  renderDownload(entry);
   if (entry.requesting) return;
   // Revalidate ready jobs so changed source files and expired caches are handled.
   if (entry.job?.status === "ready") requestDownload(entry);
-  else if (entry.job && entry.job.status !== "failed") refreshDownload(entry);
-  else if (!entry.error && !entry.job) requestDownload(entry);
+  else if (entry.job || entry.error) {
+    showDownloadDialog(entry);
+    if (entry.job && entry.job.status !== "failed") refreshDownload(entry);
+  } else requestDownload(entry);
 }
 $("closeDownload").addEventListener("click", () => $("downloadDialog").close());
 $("downloadDialog").addEventListener("close", () => {
+  // A queued close event can arrive after another download has already started.
+  if (
+    $("downloadDialog").open ||
+    downloadDialogGeneration !== downloadGeneration
+  )
+    return;
   stopDownloadPolling();
   activeDownload = null;
   autoStartDownload = false;

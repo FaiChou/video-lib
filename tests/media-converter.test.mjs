@@ -17,11 +17,66 @@ import {
   MP4,
   VideoSampleSink,
 } from "mediabunny";
-import { normalizeVideo } from "../media-converter.mjs";
+import { isCompatibleVideo, normalizeVideo } from "../media-converter.mjs";
 
 // These 0.5-second fixtures are synthetic test patterns and a 440 Hz tone.
 // Tests exercise actual codecs; ffmpeg is not needed to run this suite.
 const fixtures = fileURLToPath(new URL("./fixtures/", import.meta.url));
+
+test("compatibility probes inspect every supported fixture without initializing conversion or probing GPU drivers", async () => {
+  await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `
+    import assert from 'node:assert/strict';
+    import { HardwareContext } from 'node-av';
+    import { Conversion } from 'mediabunny';
+    import { open } from 'node:fs/promises';
+    import path from 'node:path';
+    HardwareContext.auto = () => { throw new Error('GPU probing is unavailable'); };
+    Conversion.init = () => { throw new Error('Probing must not initialize conversion'); };
+    const { isCompatibleVideo } = await import('./media-converter.mjs');
+    for (const [name, compatible] of [
+      ['h264-aac.mp4', true],
+      ['vp9-silent-odd.webm', false],
+      ['vp9-opus.webm', false],
+      ['h264-pcm.mov', false],
+      ['h264-aac.mov', false],
+    ]) {
+      const handle = await open(path.join(process.argv[1], name), 'r');
+      try {
+        assert.equal(await isCompatibleVideo({
+          handle,
+          get outputPath() { throw new Error('Probing must not access an output path'); },
+        }), compatible, name);
+      } finally {
+        await handle.close();
+      }
+    }
+  `, fixtures], {
+    cwd: fileURLToPath(new URL("../", import.meta.url)),
+    timeout: 30000,
+  });
+});
+
+test("compatibility probes dispose inputs without creating output, closing handles, or moving their position", async (t) => {
+  const disposal = t.mock.method(Input.prototype, "dispose");
+  for (const [name, compatible] of [
+    ["h264-aac.mp4", true],
+    ["vp9-silent-odd.webm", false],
+    ["vp9-opus.webm", false],
+    ["h264-pcm.mov", false],
+    ["h264-aac.mov", false],
+  ]) {
+    const options = await fixture(t, name);
+    const prefix = Buffer.alloc(7);
+    await options.handle.read(prefix, 0, prefix.length, null);
+    const previousDisposals = disposal.mock.callCount();
+    assert.equal(await isCompatibleVideo(options), compatible, name);
+    assert.equal(disposal.mock.callCount(), previousDisposals + 1);
+    await assert.rejects(stat(options.outputPath), { code: "ENOENT" });
+    const next = Buffer.alloc(7);
+    await options.handle.read(next, 0, next.length, null);
+    assert.deepEqual(next, (await readFile(options.inputPath)).subarray(7, 14));
+  }
+});
 
 test("a fresh process converts VP9 without probing GPU drivers for decoding or encoding", async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "video-software-"));
@@ -167,6 +222,7 @@ test("corrupt inputs and playlists are rejected without leaving output", async (
     await writeFile(file, contents);
     const handle = await open(file, "r");
     try {
+      await assert.rejects(isCompatibleVideo({ handle }), /无法处理视频/);
       await assert.rejects(normalizeVideo({ handle, outputPath: options.outputPath }), /无法处理视频/);
       await assert.rejects(stat(options.outputPath), { code: "ENOENT" });
       assert.equal((await handle.stat()).size, contents.length);
@@ -226,5 +282,26 @@ test("cancellation before and during conversion removes partial output and keeps
     }), { name: "AbortError" });
     await assert.rejects(stat(options.outputPath), { code: "ENOENT" });
     assert.ok((await options.handle.stat()).size > 0);
+  }
+});
+
+test("cancellation before and during probing keeps input handles open", async (t) => {
+  for (const beforeStart of [true, false]) {
+    const options = await fixture(t, "h264-aac.mp4");
+    const controller = new AbortController();
+    if (beforeStart) controller.abort();
+    await assert.rejects(isCompatibleVideo({
+      handle: {
+        stat: () => options.handle.stat(),
+        async read(...args) {
+          const result = await options.handle.read(...args);
+          controller.abort();
+          return result;
+        },
+      },
+      signal: controller.signal,
+    }), { name: "AbortError" });
+    assert.ok((await options.handle.stat()).size > 0);
+    await assert.rejects(stat(options.outputPath), { code: "ENOENT" });
   }
 });

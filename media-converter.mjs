@@ -20,16 +20,8 @@ import { registerMediabunnyServer } from "@mediabunny/server";
 // the output encoder, so conversion works without CUDA/VAAPI dependencies.
 registerMediabunnyServer({ hardwareContext: null });
 
-// The caller owns handle and must keep it open until this promise settles.
-// outputPath must be a fresh temporary path, separate from the input file.
-export async function normalizeVideo({
-  handle,
-  outputPath,
-  onProgress = () => {},
-  signal,
-}) {
-  signal?.throwIfAborted();
-  const input = new Input({
+function createVideoInput(handle, signal) {
+  return new Input({
     formats: [MP4, QTFF, WEBM, MATROSKA],
     source: new CustomSource({
       getSize: async () => (await handle.stat()).size,
@@ -48,6 +40,56 @@ export async function normalizeVideo({
       }),
     }),
   });
+}
+
+async function hasCompatibleVideoTracks(input, signal) {
+  const format = await input.getFormat();
+  const videos = await input.getVideoTracks();
+  const audios = await input.getAudioTracks();
+  if (!videos.length) throw new Error("文件不包含视频轨道");
+  const tracks = [...videos, ...audios];
+  const codecs = await Promise.all(tracks.map((track) => track.getCodec()));
+  if (codecs.some((codec) => !codec)) throw new Error("视频包含不支持的音视频编码");
+  for (const track of tracks) {
+    const sink = new EncodedPacketSink(track);
+    if (!(await sink.getFirstPacket()) || !(await sink.getPacket(Infinity))) {
+      throw new Error("视频包含空轨道或不完整的媒体数据");
+    }
+  }
+  signal?.throwIfAborted();
+  return format === MP4 &&
+    codecs.slice(0, videos.length).every((codec) => codec === "avc") &&
+    codecs.slice(videos.length).every((codec) => codec === "aac");
+}
+
+// Inspect encoded packets only: no decoder, encoder, or output is created.
+// The caller owns handle; explicit reads preserve its current position.
+export async function isCompatibleVideo({ handle, signal }) {
+  signal?.throwIfAborted();
+  const input = createVideoInput(handle, signal);
+  const abort = () => input.dispose();
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    return await hasCompatibleVideoTracks(input, signal);
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw new Error(`无法处理视频，文件可能损坏或编码不受支持：${error.message}`, { cause: error });
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    input.dispose();
+  }
+}
+
+// The caller owns handle and must keep it open until this promise settles.
+// outputPath must be a fresh temporary path, separate from the input file.
+export async function normalizeVideo({
+  handle,
+  outputPath,
+  onProgress = () => {},
+  signal,
+}) {
+  signal?.throwIfAborted();
+  const input = createVideoInput(handle, signal);
   let output;
   let conversion;
   let cancellation;
@@ -59,25 +101,7 @@ export async function normalizeVideo({
   signal?.addEventListener("abort", abort, { once: true });
 
   try {
-    const format = await input.getFormat();
-    const videos = await input.getVideoTracks();
-    const audios = await input.getAudioTracks();
-    if (!videos.length) throw new Error("文件不包含视频轨道");
-    const tracks = [...videos, ...audios];
-    const codecs = await Promise.all(tracks.map((track) => track.getCodec()));
-    if (codecs.some((codec) => !codec)) throw new Error("视频包含不支持的音视频编码");
-    for (const track of tracks) {
-      const sink = new EncodedPacketSink(track);
-      if (!(await sink.getFirstPacket()) || !(await sink.getPacket(Infinity))) {
-        throw new Error("视频包含空轨道或不完整的媒体数据");
-      }
-    }
-    signal?.throwIfAborted();
-    if (
-      format === MP4 &&
-      codecs.slice(0, videos.length).every((codec) => codec === "avc") &&
-      codecs.slice(videos.length).every((codec) => codec === "aac")
-    ) {
+    if (await hasCompatibleVideoTracks(input, signal)) {
       return { converted: false };
     }
 

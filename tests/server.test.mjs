@@ -16,7 +16,7 @@ import {
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { createVideoServer } from "../server.mjs";
-import { normalizeVideo } from "../media-converter.mjs";
+import { isCompatibleVideo, normalizeVideo } from "../media-converter.mjs";
 import { BufferSource, Input, MP4 } from "mediabunny";
 
 async function fixture(t, options = {}) {
@@ -32,6 +32,7 @@ async function fixture(t, options = {}) {
     timeZone: "Asia/Shanghai",
     // These transport tests use arbitrary bytes; codec integration is tested below.
     normalizeVideo: async () => ({ converted: false }),
+    isCompatibleVideo: async () => false,
     ...options,
   });
   server.listen(0, "127.0.0.1");
@@ -658,7 +659,7 @@ test("real uploads normalize VP9 to MP4, keep H264 bytes, resolve converted-name
 test("legacy VP9 downloads convert once, retain the original, reuse cache across restart and invalidate changed sources", async (t) => {
   let calls = 0;
   const countingConverter = async (options) => { calls++; return normalizeVideo(options); };
-  const { base, videoDir, publicDir, server } = await fixture(t, { normalizeVideo: countingConverter });
+  const { base, videoDir, publicDir, server } = await fixture(t, { normalizeVideo: countingConverter, isCompatibleVideo });
   await mkdir(path.join(videoDir, "legacy"));
   const source = await sample("vp9-opus.webm");
   const sourcePath = path.join(videoDir, "legacy", "old.webm");
@@ -682,7 +683,7 @@ test("legacy VP9 downloads convert once, retain the original, reuse cache across
   assert.equal((await (await fetch(`${base}/api/library`)).json()).videos.length, 1);
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));
-  const restarted = await createVideoServer({ videoDir, publicDir, normalizeVideo: countingConverter });
+  const restarted = await createVideoServer({ videoDir, publicDir, normalizeVideo: countingConverter, isCompatibleVideo });
   restarted.listen(0, "127.0.0.1");
   await once(restarted, "listening");
   t.after(async () => {
@@ -690,7 +691,9 @@ test("legacy VP9 downloads convert once, retain the original, reuse cache across
     await new Promise((resolve) => restarted.close(resolve));
   });
   const secondBase = `http://127.0.0.1:${restarted.address().port}`;
-  const cached = await waitForDownload(secondBase, (await (await startDownload(secondBase, "legacy", "old.webm")).json()).job);
+  const cachedResponse = await startDownload(secondBase, "legacy", "old.webm");
+  assert.equal(cachedResponse.status, 200);
+  const cached = (await cachedResponse.json()).job;
   assert.equal(cached.status, "ready");
   assert.equal(calls, 1);
   await writeFile(sourcePath, await sample("vp9-silent-odd.webm"));
@@ -700,16 +703,21 @@ test("legacy VP9 downloads convert once, retain the original, reuse cache across
   assert.equal(calls, 2);
 });
 
-test("compatible downloads bypass encoding and reject changed source files", async (t) => {
-  const { base, videoDir } = await fixture(t, { normalizeVideo });
+test("compatible downloads are ready in the initial response, bypass encoding and reject changed source files", async (t) => {
+  const { base, videoDir } = await fixture(t, {
+    isCompatibleVideo,
+    normalizeVideo: () => { throw new Error("Compatible files must never enter conversion"); },
+  });
   await mkdir(path.join(videoDir, "user"));
   const bytes = await sample("h264-aac.mp4");
   const sourcePath = path.join(videoDir, "user", "clip.mp4");
   await writeFile(sourcePath, bytes);
-  const job = await waitForDownload(base, (await (await startDownload(base, "user", "clip.mp4")).json()).job);
+  const response = await startDownload(base, "user", "clip.mp4");
+  assert.equal(response.status, 200);
+  const { job } = await response.json();
   assert.equal(job.status, "ready");
   assert.deepEqual(Buffer.from(await (await fetch(`${base}${job.downloadUrl}`)).arrayBuffer()), bytes);
-  assert.deepEqual(await readdir(path.join(videoDir, ".transcoded")), []);
+  await assert.rejects(readdir(path.join(videoDir, ".transcoded")), { code: "ENOENT" });
   await writeFile(sourcePath, "changed");
   assert.equal((await fetch(`${base}${job.downloadUrl}`)).status, 409);
 });
@@ -821,4 +829,93 @@ test("expired download cache is cleaned and ready jobs regenerate missing files"
   assert.equal(regenerated.status, "ready");
   assert.equal(calls, 3);
   assert.equal((await fetch(`${base}${regenerated.downloadUrl}`)).status, 200);
+});
+
+test("compatible originals and disk cache hits are ready while a conversion occupies the queue", async (t) => {
+  const gate = Promise.withResolvers();
+  const entered = Promise.withResolvers();
+  let block = false;
+  let conversions = 0;
+  const { base, videoDir } = await fixture(t, {
+    isCompatibleVideo,
+    normalizeVideo: async (options) => {
+      conversions++;
+      if (block) {
+        entered.resolve();
+        await gate.promise;
+      }
+      return normalizeVideo(options);
+    },
+  });
+  await mkdir(path.join(videoDir, "user"));
+  const vp9 = await sample("vp9-opus.webm");
+  const h264 = await sample("h264-aac.mp4");
+  await writeFile(path.join(videoDir, "user", "cached.webm"), vp9);
+  await writeFile(path.join(videoDir, "user", "blocked.webm"), vp9);
+  await writeFile(path.join(videoDir, "user", "compatible.mp4"), h264);
+  const cached = await waitForDownload(base, (await (await startDownload(base, "user", "cached.webm")).json()).job);
+  assert.equal(cached.status, "ready");
+  block = true;
+  const blocked = (await (await startDownload(base, "user", "blocked.webm")).json()).job;
+  await entered.promise;
+  try {
+    const compatibleResponse = await startDownload(base, "user", "compatible.mp4");
+    assert.equal(compatibleResponse.status, 200);
+    const compatible = (await compatibleResponse.json()).job;
+    assert.equal(compatible.status, "ready");
+    assert.deepEqual(Buffer.from(await (await fetch(`${base}${compatible.downloadUrl}`)).arrayBuffer()), h264);
+    const cachedResponse = await startDownload(base, "user", "cached.webm");
+    assert.equal(cachedResponse.status, 200);
+    assert.equal((await cachedResponse.json()).job.status, "ready");
+    assert.equal(conversions, 2);
+    const waiting = (await (await fetch(`${base}/api/downloads/${blocked.id}`)).json()).job;
+    assert.equal(waiting.status, "processing");
+  } finally {
+    gate.resolve();
+    await waitForDownload(base, blocked);
+  }
+});
+
+test("simultaneous compatibility checks are coalesced, reused and invalidated when the source changes", async (t) => {
+  let probes = 0;
+  const { base, videoDir } = await fixture(t, {
+    isCompatibleVideo: async (options) => {
+      probes++;
+      await delay(30);
+      return isCompatibleVideo(options);
+    },
+    normalizeVideo,
+  });
+  await mkdir(path.join(videoDir, "user"));
+  const sourcePath = path.join(videoDir, "user", "clip.mp4");
+  await writeFile(sourcePath, await sample("h264-aac.mp4"));
+  const responses = await Promise.all(Array.from({ length: 5 }, () => startDownload(base, "user", "clip.mp4")));
+  assert.ok(responses.every((response) => response.status === 200));
+  const jobs = await Promise.all(responses.map(async (response) => (await response.json()).job));
+  assert.equal(new Set(jobs.map((job) => job.id)).size, 1);
+  assert.ok(jobs.every((job) => job.status === "ready"));
+  assert.equal(probes, 1);
+  assert.equal((await startDownload(base, "user", "clip.mp4")).status, 200);
+  assert.equal(probes, 1);
+  await writeFile(sourcePath, await sample("vp9-opus.webm"));
+  const changed = await startDownload(base, "user", "clip.mp4");
+  assert.equal(changed.status, 202);
+  const changedJob = (await changed.json()).job;
+  assert.notEqual(changedJob.id, jobs[0].id);
+  assert.equal((await waitForDownload(base, changedJob)).status, "ready");
+  assert.equal(probes, 2);
+});
+
+test("corrupt media fails its download check without queuing a conversion", async (t) => {
+  let conversions = 0;
+  const { base, videoDir } = await fixture(t, {
+    isCompatibleVideo,
+    normalizeVideo: async () => { conversions++; return { converted: false }; },
+  });
+  await mkdir(path.join(videoDir, "user"));
+  await writeFile(path.join(videoDir, "user", "broken.mp4"), "not a video");
+  const response = await startDownload(base, "user", "broken.mp4");
+  assert.equal(response.status, 422);
+  assert.match((await response.json()).error, /编码/);
+  assert.equal(conversions, 0);
 });

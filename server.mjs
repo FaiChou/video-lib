@@ -19,7 +19,7 @@ import { networkInterfaces } from "node:os";
 import { isIP } from "node:net";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { normalizeVideo } from "./media-converter.mjs";
+import { isCompatibleVideo, normalizeVideo } from "./media-converter.mjs";
 
 const PROJECT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HOST = "0.0.0.0";
@@ -217,7 +217,9 @@ export async function createVideoServer(options = {}) {
   }
   let processedWrite = Promise.resolve();
   const convertVideo = options.normalizeVideo ?? normalizeVideo;
+  const inspectVideo = options.isCompatibleVideo ?? isCompatibleVideo;
   const downloadJobs = new Map();
+  const downloadChecks = new Map();
   const cacheDir = path.join(videoDir, ".transcoded");
   const cacheLifetime = 7 * 24 * 60 * 60 * 1000;
   let conversionTail = Promise.resolve();
@@ -233,11 +235,19 @@ export async function createVideoServer(options = {}) {
     return task;
   }
 
-  async function prepareCache() {
-    await mkdir(cacheDir, { recursive: true });
-    const info = await lstat(cacheDir);
+  async function cacheExists() {
+    const info = await lstat(cacheDir).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+    if (!info) return false;
     if (!info.isDirectory() || info.isSymbolicLink() || await realpath(cacheDir) !== cacheDir)
       throw new HttpError(500, "转码缓存目录无效。");
+    return true;
+  }
+
+  async function prepareCache() {
+    await mkdir(cacheDir, { recursive: true });
+    await cacheExists();
     const cutoff = Date.now() - cacheLifetime;
     for (const name of await readdir(cacheDir)) {
       if (!/^([a-f0-9]{64}\.mp4|\.convert-[a-f0-9-]+\.part)$/.test(name)) continue;
@@ -313,73 +323,107 @@ export async function createVideoServer(options = {}) {
     ])).digest("hex");
     let transferred = false;
     try {
-      const existing = downloadJobs.get(id);
-      if (existing && existing.status !== "failed") {
-        const available = !existing.filePath || await lstat(existing.filePath).then(
-          (stat) => stat.isFile() && !stat.isSymbolicLink(), () => false,
-        );
-        if (available) {
-          if (existing.status === "ready" && !existing.sourceInfo)
-            await utimes(existing.filePath, new Date(), new Date());
-          return { job: jobData(existing) };
-        }
-      }
-      // Keep a bounded status history. Files remain reusable on disk for seven days.
-      if (downloadJobs.size >= 200) {
-        for (const [key, job] of downloadJobs) {
-          if (["ready", "failed"].includes(job.status)) downloadJobs.delete(key);
-          if (downloadJobs.size < 200) break;
-        }
-      }
-      const job = { id, status: "queued", progress: 0, name: `${path.parse(name).name}.mp4` };
-      const task = scheduleConversion(async () => {
-        const tempPath = path.join(cacheDir, `.convert-${randomUUID()}.part`);
-        try {
-          job.status = "processing";
-          await prepareCache();
-          const target = path.join(cacheDir, `${id}.mp4`);
-          const cached = await lstat(target).catch((error) => {
+      // Coalesce concurrent checks before probing or submitting a conversion.
+      // Each request still closes its own file handle unless the queue owns it.
+      if (downloadChecks.has(id))
+        return { job: jobData(await downloadChecks.get(id)) };
+      const check = (async () => {
+        const existing = downloadJobs.get(id);
+        if (existing && ["queued", "processing"].includes(existing.status)) return existing;
+
+        const target = path.join(cacheDir, `${id}.mp4`);
+        const job = {
+          id, status: "ready", progress: 1, name: `${path.parse(name).name}.mp4`,
+          downloadUrl: `/api/downloads/${id}/file`,
+        };
+        let cached;
+        if (await cacheExists()) {
+          cached = await lstat(target).catch((error) => {
             if (error.code !== "ENOENT") throw error;
           });
-          let converted = cached?.isFile() && !cached.isSymbolicLink();
-          if (!converted) {
-            ({ converted } = await convertVideo({
-              handle,
-              outputPath: tempPath,
-              onProgress: (progress) => { job.progress = progress; },
-            }));
-            if (converted) await rename(tempPath, target);
+        }
+        if (cached?.isFile() && !cached.isSymbolicLink() && cached.mtimeMs >= Date.now() - cacheLifetime) {
+          await utimes(target, new Date(), new Date());
+          job.filePath = target;
+        } else {
+          let compatible = !!existing?.sourceInfo;
+          if (!compatible) {
+            try {
+              compatible = await inspectVideo({ handle });
+            } catch (error) {
+              console.error("下载编码检查失败:", error.message);
+              throw new HttpError(422, "无法检查此视频的编码，请检查文件是否损坏或下载原文件。");
+            }
           }
-          // Do not publish a result if another process rewrote the source during conversion.
-          const after = await handle.stat();
-          if (after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) {
-            if (converted) await unlink(target).catch(() => {});
-            throw new Error("转码期间源文件发生变化，请重新下载。");
-          }
-          if (converted) {
-            await utimes(target, new Date(), new Date());
-            job.filePath = target;
-          } else {
+          if (compatible) {
             job.filePath = path.join(videoDir, user, name);
             job.sourceInfo = info;
           }
-          job.downloadUrl = `/api/downloads/${id}/file`;
-          job.progress = 1;
-          job.status = "ready";
-        } catch (error) {
-          console.error("下载转码失败:", error.message);
-          job.status = "failed";
-          job.error = "无法转换此视频，请重试或下载原文件。";
-        } finally {
-          await handle.close().catch(() => {});
-          await unlink(tempPath).catch(() => {});
         }
-      });
-      transferred = true;
-      downloadJobs.set(id, job);
-      // run() records failures in the job; keep unexpected cleanup errors handled as well.
-      task.catch((error) => console.error("下载任务失败:", error.message));
-      return { job: jobData(job) };
+        const sourceUnchanged = async () => {
+          const after = await handle.stat();
+          return ["dev", "ino", "size", "mtimeMs", "ctimeMs"].every((key) => after[key] === info[key]);
+        };
+        if (!await sourceUnchanged())
+          throw new HttpError(409, "源文件发生变化，请重新下载。");
+
+        // Keep a bounded status history. Cached files remain reusable after eviction.
+        if (downloadJobs.size >= 200) {
+          for (const [key, previous] of downloadJobs) {
+            if (["ready", "failed"].includes(previous.status)) downloadJobs.delete(key);
+            if (downloadJobs.size < 200) break;
+          }
+        }
+        if (job.filePath) {
+          downloadJobs.set(id, job);
+          return job;
+        }
+
+        // Only actual conversions wait for the shared CPU queue. Compatible
+        // originals and cache hits return ready in this very first response.
+        job.status = "queued";
+        job.progress = 0;
+        const task = scheduleConversion(async () => {
+          const tempPath = path.join(cacheDir, `.convert-${randomUUID()}.part`);
+          try {
+            job.status = "processing";
+            await prepareCache();
+            const { converted } = await convertVideo({
+              handle,
+              outputPath: tempPath,
+              onProgress: (progress) => { job.progress = progress; },
+            });
+            if (!await sourceUnchanged())
+              throw new Error("转码期间源文件发生变化，请重新下载。");
+            if (converted) {
+              await rename(tempPath, target);
+              job.filePath = target;
+            } else {
+              job.filePath = path.join(videoDir, user, name);
+              job.sourceInfo = info;
+            }
+            job.progress = 1;
+            job.status = "ready";
+          } catch (error) {
+            console.error("下载转码失败:", error.message);
+            job.status = "failed";
+            job.error = "无法转换此视频，请重试或下载原文件。";
+          } finally {
+            await handle.close().catch(() => {});
+            await unlink(tempPath).catch(() => {});
+          }
+        });
+        transferred = true;
+        downloadJobs.set(id, job);
+        task.catch((error) => console.error("下载任务失败:", error.message));
+        return job;
+      })();
+      downloadChecks.set(id, check);
+      try {
+        return { job: jobData(await check) };
+      } finally {
+        downloadChecks.delete(id);
+      }
     } finally {
       if (!transferred) await handle.close();
     }
@@ -756,7 +800,8 @@ export async function createVideoServer(options = {}) {
         return;
       }
       if (url.pathname === "/api/downloads" && req.method === "POST") {
-        json(res, 202, await createDownload(req));
+        const data = await createDownload(req);
+        json(res, data.job.status === "ready" ? 200 : 202, data);
         return;
       }
       const downloadMatch = /^\/api\/downloads\/([a-f0-9]{64})(\/file)?$/.exec(url.pathname);

@@ -1245,6 +1245,11 @@ dialog::backdrop {
   max-width: calc(100vw - 40px);
   text-align: center;
 }
+.toast-download {
+  color: inherit;
+  text-decoration: underline;
+  margin-left: 4px;
+}
 .noscript {
   position: fixed;
   inset: 0;
