@@ -952,6 +952,43 @@ dialog::backdrop {
 .player-dialog > .error-message {
   margin: 14px 24px;
 }
+.download-dialog {
+  width: 480px;
+  background: white;
+}
+.download-dialog .dialog-heading h2 {
+  font-size: 20px;
+  margin: 0;
+}
+.download-name {
+  margin: 0 0 20px;
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.download-status {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 550;
+}
+.download-hint {
+  margin: 18px 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #8b8293;
+}
+.download-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.download-action[aria-busy="true"] {
+  color: var(--pink-dark);
+}
+.drop-zone small {
+  font-size: 10px;
+  color: #9b8ca5;
+}
 .upload-dialog {
   width: 650px;
   overflow: hidden;
@@ -1034,7 +1071,7 @@ dialog::backdrop {
   font-size: 13px;
   font-weight: 550;
 }
-.drop-zone > span:last-child {
+.drop-zone > span:not([data-icon]) {
   font-size: 10px;
   color: #b2a4b3;
 }

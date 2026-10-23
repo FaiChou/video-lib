@@ -3,12 +3,16 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "无需构建、无需第三方依赖的本地视频库",
+  "description": "无需构建、支持自动转换 H.264 MP4 的本地视频库",
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test tests/*.test.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@mediabunny/server": "1.62.1",
+    "mediabunny": "1.62.1"
   }
 }

@@ -11,13 +11,15 @@ import {
   unlink,
   readFile,
   rename,
+  utimes,
 } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { isIP } from "node:net";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { normalizeVideo } from "./media-converter.mjs";
 
 const PROJECT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HOST = "0.0.0.0";
@@ -214,6 +216,48 @@ export async function createVideoServer(options = {}) {
       throw new Error(`无法读取处理状态 ${processedPath}：${error.message}`);
   }
   let processedWrite = Promise.resolve();
+  const convertVideo = options.normalizeVideo ?? normalizeVideo;
+  const downloadJobs = new Map();
+  const cacheDir = path.join(videoDir, ".transcoded");
+  const cacheLifetime = 7 * 24 * 60 * 60 * 1000;
+  let conversionTail = Promise.resolve();
+  let pendingConversions = 0;
+
+  // Share one queue between uploads and downloads to bound CPU and codec memory.
+  function scheduleConversion(run) {
+    if (pendingConversions >= 20)
+      throw new HttpError(429, "转码任务较多，请稍后重试。");
+    pendingConversions++;
+    const task = conversionTail.then(run);
+    conversionTail = task.catch(() => {}).finally(() => pendingConversions--);
+    return task;
+  }
+
+  async function prepareCache() {
+    await mkdir(cacheDir, { recursive: true });
+    const info = await lstat(cacheDir);
+    if (!info.isDirectory() || info.isSymbolicLink() || await realpath(cacheDir) !== cacheDir)
+      throw new HttpError(500, "转码缓存目录无效。");
+    const cutoff = Date.now() - cacheLifetime;
+    for (const name of await readdir(cacheDir)) {
+      if (!/^([a-f0-9]{64}\.mp4|\.convert-[a-f0-9-]+\.part)$/.test(name)) continue;
+      const filePath = path.join(cacheDir, name);
+      const cached = await lstat(filePath).catch(() => null);
+      if (cached?.isFile() && cached.mtimeMs < cutoff)
+        await unlink(filePath).catch(() => {});
+    }
+  }
+
+  function jobData(job) {
+    return {
+      id: job.id,
+      status: job.status,
+      progress: job.progress,
+      name: job.name,
+      ...(job.status === "ready" ? { downloadUrl: job.downloadUrl } : {}),
+      ...(job.status === "failed" ? { error: job.error } : {}),
+    };
+  }
 
   async function userFolder(user, create = false) {
     safeSegment(user, "用户名");
@@ -238,6 +282,107 @@ export async function createVideoServer(options = {}) {
       throw new HttpError(400, "用户目录必须是视频文件夹中的真实文件夹。");
     }
     return folder;
+  }
+
+  async function openVideo(user, name) {
+    safeSegment(name);
+    if (!VIDEO_TYPES.has(path.extname(name).toLowerCase()))
+      throw new HttpError(404, "视频不存在。");
+    const folder = await userFolder(user);
+    let handle;
+    try {
+      handle = await open(path.join(folder, name), constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+      const info = await handle.stat();
+      if (!info.isFile()) throw new HttpError(404, "视频不存在。");
+      return { handle, info };
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      if (["ENOENT", "ENOTDIR", "ELOOP"].includes(error.code))
+        throw new HttpError(404, "视频不存在。");
+      throw error;
+    }
+  }
+
+  async function createDownload(req) {
+    const body = await readJson(req);
+    const user = safeSegment(body?.user, "用户名");
+    const name = safeSegment(body?.name);
+    const { handle, info } = await openVideo(user, name);
+    const id = createHash("sha256").update(JSON.stringify([
+      "h264-aac-v1", user, name, info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs,
+    ])).digest("hex");
+    let transferred = false;
+    try {
+      const existing = downloadJobs.get(id);
+      if (existing && existing.status !== "failed") {
+        const available = !existing.filePath || await lstat(existing.filePath).then(
+          (stat) => stat.isFile() && !stat.isSymbolicLink(), () => false,
+        );
+        if (available) {
+          if (existing.status === "ready" && !existing.sourceInfo)
+            await utimes(existing.filePath, new Date(), new Date());
+          return { job: jobData(existing) };
+        }
+      }
+      // Keep a bounded status history. Files remain reusable on disk for seven days.
+      if (downloadJobs.size >= 200) {
+        for (const [key, job] of downloadJobs) {
+          if (["ready", "failed"].includes(job.status)) downloadJobs.delete(key);
+          if (downloadJobs.size < 200) break;
+        }
+      }
+      const job = { id, status: "queued", progress: 0, name: `${path.parse(name).name}.mp4` };
+      const task = scheduleConversion(async () => {
+        const tempPath = path.join(cacheDir, `.convert-${randomUUID()}.part`);
+        try {
+          job.status = "processing";
+          await prepareCache();
+          const target = path.join(cacheDir, `${id}.mp4`);
+          const cached = await lstat(target).catch((error) => {
+            if (error.code !== "ENOENT") throw error;
+          });
+          let converted = cached?.isFile() && !cached.isSymbolicLink();
+          if (!converted) {
+            ({ converted } = await convertVideo({
+              handle,
+              outputPath: tempPath,
+              onProgress: (progress) => { job.progress = progress; },
+            }));
+            if (converted) await rename(tempPath, target);
+          }
+          // Do not publish a result if another process rewrote the source during conversion.
+          const after = await handle.stat();
+          if (after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) {
+            if (converted) await unlink(target).catch(() => {});
+            throw new Error("转码期间源文件发生变化，请重新下载。");
+          }
+          if (converted) {
+            await utimes(target, new Date(), new Date());
+            job.filePath = target;
+          } else {
+            job.filePath = path.join(videoDir, user, name);
+            job.sourceInfo = info;
+          }
+          job.downloadUrl = `/api/downloads/${id}/file`;
+          job.progress = 1;
+          job.status = "ready";
+        } catch (error) {
+          console.error("下载转码失败:", error.message);
+          job.status = "failed";
+          job.error = "无法转换此视频，请重试或下载原文件。";
+        } finally {
+          await handle.close().catch(() => {});
+          await unlink(tempPath).catch(() => {});
+        }
+      });
+      transferred = true;
+      downloadJobs.set(id, job);
+      // run() records failures in the job; keep unexpected cleanup errors handled as well.
+      task.catch((error) => console.error("下载任务失败:", error.message));
+      return { job: jobData(job) };
+    } finally {
+      if (!transferred) await handle.close();
+    }
   }
 
   function videoMetadata(user, name, info) {
@@ -350,7 +495,7 @@ export async function createVideoServer(options = {}) {
     return write;
   }
 
-  async function upload(req, url) {
+  async function upload(req, url, res) {
     const user = url.searchParams.get("user");
     const originalName = safeSegment(url.searchParams.get("name"));
     const extension = path.extname(originalName).toLowerCase();
@@ -361,7 +506,7 @@ export async function createVideoServer(options = {}) {
       throw new HttpError(400, "日期无效，请使用 YYYY-MM-DD。");
     const date = dateOverride || filenameDate(originalName) || localDate();
     const suffix = originalName.replace(/^\d{8}_/, "");
-    const name = safeSegment(`${date.replaceAll("-", "")}_${suffix}`);
+    let name = safeSegment(`${date.replaceAll("-", "")}_${suffix}`);
     const folder = await userFolder(user);
     const declaredLength = req.headers["content-length"];
     if (
@@ -371,6 +516,12 @@ export async function createVideoServer(options = {}) {
       throw new HttpError(413, "视频超过上传大小限制。");
     }
     const tempPath = path.join(folder, `.upload-${randomUUID()}.part`);
+    const convertedPath = path.join(folder, `.convert-${randomUUID()}.part`);
+    const controller = new AbortController();
+    const onClosed = () => {
+      if (!res.writableEnded) controller.abort();
+    };
+    res.once("close", onClosed);
     let handle;
     let size = 0;
     let savedName;
@@ -412,6 +563,27 @@ export async function createVideoServer(options = {}) {
       await handle.close();
       handle = null;
       if (!size) throw new HttpError(400, "不能上传空文件。");
+      let publishPath = tempPath;
+      try {
+        const result = await scheduleConversion(async () => {
+          controller.signal.throwIfAborted();
+          const source = await open(tempPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+          try {
+            return await convertVideo({ handle: source, outputPath: convertedPath, signal: controller.signal });
+          } finally {
+            await source.close();
+          }
+        });
+        controller.signal.throwIfAborted();
+        if (result.converted) {
+          publishPath = convertedPath;
+        }
+        name = safeSegment(`${path.parse(name).name}.mp4`);
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        console.error("上传转码失败:", error.message);
+        throw new HttpError(422, "视频无法转为 H.264 MP4，请检查文件是否损坏或使用其他素材。");
+      }
       await userFolder(user); // Re-check the destination before publishing.
       const ext = path.extname(name);
       const stem = name.slice(0, -ext.length);
@@ -419,7 +591,7 @@ export async function createVideoServer(options = {}) {
         savedName = attempt === 1 ? name : `${stem}_${attempt}${ext}`;
         safeSegment(savedName);
         try {
-          await link(tempPath, path.join(folder, savedName));
+          await link(publishPath, path.join(folder, savedName));
           break;
         } catch (error) {
           if (error.code !== "EEXIST") throw error;
@@ -430,7 +602,9 @@ export async function createVideoServer(options = {}) {
       const info = await lstat(path.join(folder, savedName));
       return { video: videoMetadata(user, savedName, info) };
     } finally {
+      res.off("close", onClosed);
       if (handle) await handle.close().catch(() => {});
+      await unlink(convertedPath).catch(() => {});
       await unlink(tempPath).catch((error) => {
         if (error.code !== "ENOENT")
           console.error("临时文件清理失败:", error.message);
@@ -438,7 +612,7 @@ export async function createVideoServer(options = {}) {
     }
   }
 
-  async function streamFile(req, res, filePath, contentType, downloadName) {
+  async function streamFile(req, res, filePath, contentType, downloadName, expectedInfo) {
     let handle;
     try {
       handle = await open(
@@ -451,6 +625,10 @@ export async function createVideoServer(options = {}) {
       throw error;
     }
     const info = await handle.stat();
+    if (expectedInfo && ["dev", "ino", "size", "mtimeMs", "ctimeMs"].some((key) => info[key] !== expectedInfo[key])) {
+      await handle.close();
+      throw new HttpError(409, "源文件发生变化，请重新准备下载。");
+    }
     if (!info.isFile()) {
       await handle.close();
       throw new HttpError(404, "文件不存在。");
@@ -574,7 +752,26 @@ export async function createVideoServer(options = {}) {
         return;
       }
       if (url.pathname === "/api/upload" && req.method === "POST") {
-        json(res, 201, await upload(req, url));
+        json(res, 201, await upload(req, url, res));
+        return;
+      }
+      if (url.pathname === "/api/downloads" && req.method === "POST") {
+        json(res, 202, await createDownload(req));
+        return;
+      }
+      const downloadMatch = /^\/api\/downloads\/([a-f0-9]{64})(\/file)?$/.exec(url.pathname);
+      if (downloadMatch && ["GET", "HEAD"].includes(req.method)) {
+        const job = downloadJobs.get(downloadMatch[1]);
+        if (!job) throw new HttpError(404, "下载任务已过期，请重新下载。");
+        if (!downloadMatch[2]) {
+          json(res, 200, { job: jobData(job) });
+          return;
+        }
+        if (job.status !== "ready") throw new HttpError(409, "视频尚未准备完成。");
+        if (await realpath(job.filePath).catch(() => null) !== job.filePath)
+          throw new HttpError(404, "下载文件不存在，请重新准备下载。");
+        if (!job.sourceInfo) await utimes(job.filePath, new Date(), new Date());
+        await streamFile(req, res, job.filePath, "video/mp4", job.name, job.sourceInfo);
         return;
       }
       if (url.pathname === "/api/processed" && req.method === "POST") {

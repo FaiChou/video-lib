@@ -1,6 +1,6 @@
 # Debian 部署：systemd 开机自动启动
 
-使用服务器上已有的 Node.js 20+，不需要安装 npm 依赖或执行 build。以下操作在 Debian 服务器上以 root 执行，服务也使用 root 运行，无需创建额外的系统用户或组。
+使用 Node.js 22+ 和 npm，安装依赖后即可运行，不需要执行 build。以下操作在 Debian 服务器上以 root 执行，服务也使用 root 运行，无需创建额外的系统用户或组。
 
 默认项目位置为 `/opt/video-library`，视频存放在 `/opt/video-library/videos/用户名/`，监听地址为 `0.0.0.0:8876`（所有 IPv4 网卡）。服务使用程序默认值，无需环境配置文件。
 
@@ -20,10 +20,11 @@ ssh root@nuc8.local
 ```sh
 cd ~/video-library
 node --version
+npm --version
 command -v node
 ```
 
-确认 Node 主版本为 20 或更高。记录 `command -v node` 的结果，后面配置 `ExecStart` 时需要用到。
+确认 Node 主版本为 22 或更高，并且 npm 可用。记录 `command -v node` 的结果，后面配置 `ExecStart` 时需要用到。
 
 ## 2. 安装文件并设置权限
 
@@ -31,13 +32,24 @@ command -v node
 
 ```sh
 install -d -o root -g root -m 0755 /opt/video-library
-install -m 0644 server.mjs package.json README.md DEPLOY_DEBIAN.md /opt/video-library/
+install -m 0644 server.mjs media-converter.mjs package.json package-lock.json README.md DEPLOY_DEBIAN.md /opt/video-library/
 cp -R public deploy tests /opt/video-library/
 install -d -o root -g root -m 0750 /opt/video-library/videos
 cp -R videos/. /opt/video-library/videos/
 ```
 
-`videos/` 中有素材时会一并复制；没有素材也可以直接启动，以后通过网页上传。
+`videos/` 中有素材时会一并复制；没有素材也可以先安装并启动，以后通过网页上传。
+
+在目标服务器安装依赖：
+
+```sh
+cd /opt/video-library
+npm ci
+```
+
+请保留 `package-lock.json`。`npm ci` 会安装锁定版本的 `mediabunny` 和 `@mediabunny/server`；后者依赖 NodeAV 的原生编解码器，安装时按服务器平台下载预编译依赖及附带工具，需要联网。无需手动安装或调用 FFmpeg 命令。不要从 macOS、Windows 或其他架构复制 `node_modules/`，也不要省略平台相关的可选依赖或跳过安装脚本。
+
+转换任务由服务器执行，客户端仍可通过局域网 HTTP 使用，无需 HTTPS 或浏览器 WebCodecs。首次部署后可以运行 `npm test`，验证真实视频编码转换及接口行为。
 
 然后统一设置权限：
 
@@ -57,7 +69,10 @@ chmod -R u=rwX,g=rX,o= videos
 ```text
 /opt/video-library/
 ├── server.mjs
+├── media-converter.mjs
 ├── package.json
+├── package-lock.json
+├── node_modules/
 ├── public/
 ├── deploy/
 ├── tests/
@@ -172,7 +187,7 @@ systemctl restart video-library
 
 ## 6. 更新代码或素材
 
-更新前让正在进行的上传完成，然后停止服务：
+更新前让正在进行的上传及下载转换完成，然后停止服务：
 
 ```sh
 systemctl stop video-library
@@ -182,9 +197,19 @@ systemctl stop video-library
 
 ```sh
 cd ~/video-library
-install -m 0644 server.mjs package.json README.md DEPLOY_DEBIAN.md /opt/video-library/
+install -m 0644 server.mjs media-converter.mjs package.json package-lock.json README.md DEPLOY_DEBIAN.md /opt/video-library/
 cp -R public deploy tests /opt/video-library/
 ```
+
+Git 更新或复制代码后，都必须在目标目录重新安装锁定依赖：
+
+```sh
+cd /opt/video-library
+npm ci
+npm test
+```
+
+依赖安装或测试失败时先处理错误，再启动服务。新版本会检查上传及下载素材的实际编码，不会批量覆盖已经入库的原件。
 
 如果旧版素材存放在其他目录，先将素材复制到 `/opt/video-library/videos/`；确认素材完整后再处理原目录。然后设置权限并更新服务文件：
 
@@ -214,7 +239,9 @@ chown -R root:root /opt/video-library/videos
 chmod -R u=rwX,g=rX,o= /opt/video-library/videos
 ```
 
-在网页里点击刷新即可，无需重启。备份时保留 `/opt/video-library/videos` 和 `/etc/systemd/system/video-library.service`。
+在网页里点击刷新即可，无需重启。备份时保留 `/opt/video-library/videos` 和 `/etc/systemd/system/video-library.service`。素材目录中的 `.processed.json` 保存处理状态，应随原件一起备份。
+
+旧素材下载时需要的 H.264 MP4 缓存在 `/opt/video-library/videos/.transcoded/`，不会覆盖原件，重复下载及重启服务后可复用缓存。7 天未使用的缓存会在准备新的下载任务时清理。缓存可重新生成，备份时可排除；如需释放空间，可先停止服务再删除缓存目录。上传转换及缓存生成都需要额外磁盘空间。
 
 ## 7. 常见问题
 
@@ -222,6 +249,9 @@ chmod -R u=rwX,g=rX,o= /opt/video-library/videos
 | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `203/EXEC`                    | 检查 `ExecStart` 的 Node 绝对路径，用 `/实际路径/node --version` 验证权限；nvm 路径按第三步处理。 |
 | `217/USER`                    | 安装新版服务文件，确认 `User=root`、`Group=root`，再执行 `daemon-reload`、`reset-failed` 和 `restart`。                                                                           |
+| `ERR_MODULE_NOT_FOUND` / 缺少原生模块 | 确认在服务器运行过 `npm ci`，保留锁文件、平台可选依赖与安装脚本；不要复制其他平台的 `node_modules/`。 |
+| 安装依赖下载失败             | 检查服务器访问 npm 和依赖下载地址的网络，修复后重新运行 `npm ci`。 |
+| 转换失败或等待时间较长       | 查看网页错误与 `journalctl` 日志，检查磁盘空间；转换任务串行执行，已有任务未完成时后续任务会等待。旧素材可以下载原文件。 |
 | `EADDRINUSE`                  | 服务器的 8876 端口被占用，停止占用该端口的进程后重新启动服务。                                                        |
 | `EACCES` / 上传提示服务器错误 | 检查视频目录的所有者和读写权限，并查看 `journalctl` 日志。                                                              |
 | `此 Host 不允许访问`          | 使用 `http://nuc8.local:8876` 或服务器的局域网 IPv4 地址，确认已安装新版 `server.mjs` 并重启服务。                       |

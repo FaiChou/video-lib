@@ -133,7 +133,7 @@
           ><span>选择单个或多个视频，一起上传</span
           ><span class="button primary"
             >选择视频 <span data-icon="plus"></span></span
-          ><small>支持 MP4、WebM、MOV、M4V</small>
+          ><small>支持 MP4、WebM、MOV、M4V · 保存为 H.264 MP4</small>
         </button>
         <div class="upload-notes">
           <div>
@@ -167,14 +167,68 @@
       </div>
       <video id="player" controls playsinline preload="metadata"></video>
       <p id="playbackError" class="error-message" hidden>
-        浏览器无法播放这个视频。可以下载后用本地播放器打开，或转为 H.264 编码的
-        MP4。
+        浏览器无法播放这个视频。点击下载可获取 H.264 编码的 MP4。
       </p>
       <div class="player-footer">
         <div id="playerProcessedControl"></div>
-        <a id="playerDownload" class="button secondary" download
-          ><span data-icon="download"></span>下载视频</a
+        <button
+          id="playerDownload"
+          class="button secondary download-action"
+          type="button"
+          ><span data-icon="download"></span
+          ><span class="download-label">下载</span></button
         >
+      </div>
+    </dialog>
+    <dialog
+      id="downloadDialog"
+      class="download-dialog"
+      aria-labelledby="downloadTitle"
+      aria-describedby="downloadName"
+    >
+      <div class="dialog-heading">
+        <h2 id="downloadTitle">下载视频</h2>
+        <button
+          id="closeDownload"
+          class="icon-button"
+          type="button"
+          aria-label="关闭下载弹窗"
+        >
+          <span data-icon="close"></span>
+        </button>
+      </div>
+      <div class="dialog-body">
+        <p id="downloadName" class="download-name"></p>
+        <p
+          id="downloadStatus"
+          class="download-status"
+          role="status"
+          aria-live="polite"
+        ></p>
+        <div id="downloadProgressGroup" class="overall-progress">
+          <div class="progress-meta">
+            <span>准备 H.264 MP4</span><span id="downloadPercent">0%</span>
+          </div>
+          <progress
+            id="downloadProgress"
+            max="100"
+            value="0"
+            aria-label="下载准备进度"
+          ></progress>
+        </div>
+        <p id="downloadError" class="error-message" role="alert" hidden></p>
+        <p id="downloadHint" class="download-hint"></p>
+        <div class="download-actions">
+          <a id="readyDownload" class="button primary" download hidden
+            ><span data-icon="download"></span>下载 H.264 MP4</a
+          >
+          <button id="retryDownload" class="button primary" type="button" hidden>
+            重试
+          </button>
+          <a id="originalDownload" class="button secondary" download
+            >下载原文件</a
+          >
+        </div>
       </div>
     </dialog>
     <dialog
@@ -230,7 +284,8 @@
           <button type="button" id="dropZone" class="drop-zone">
             <span class="upload-icon" data-icon="upload"></span
             ><strong>拖入视频，或点击选择</strong
-            ><span>支持多选 · MP4 / WebM / MOV / M4V</span></button
+            ><span>支持多选 · MP4 / WebM / MOV / M4V</span
+            ><small>上传后检查编码，统一保存为 H.264 MP4</small></button
           ><input
             type="file"
             id="fileInput"
@@ -255,7 +310,8 @@
           </div>
         </div>
         <div class="dialog-footer">
-          <span id="uploadFooterHint">重名文件会自动编号，已有视频会保留。</span
+          <span id="uploadFooterHint"
+            >视频将保存为 H.264 MP4；上传后请等待编码检查和处理完成。</span
           ><button
             type="submit"
             id="startUpload"

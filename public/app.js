@@ -66,6 +66,12 @@ let loadGeneration = 0,
   thumbnails;
 const pendingProcessed = new Set();
 const processedChanges = new Map();
+const downloads = new Map();
+let activeDownload = null,
+  downloadPollTimer,
+  downloadPollController,
+  downloadGeneration = 0,
+  autoStartDownload = false;
 let processedRevision = 0;
 const palette = [
   ["#f0e8f7", "#9e7cb7"],
@@ -102,7 +108,10 @@ async function api(url, options) {
   const response = await fetch(url, { cache: "no-store", ...options });
   const data = await response.json().catch(() => ({}));
   if (!response.ok)
-    throw new Error(data.error || `请求失败（${response.status}）`);
+    throw Object.assign(
+      new Error(data.error || `请求失败（${response.status}）`),
+      { status: response.status },
+    );
   return data;
 }
 function syncURL() {
@@ -300,11 +309,12 @@ function card(video) {
   meta.append(avatar(video.user), user, date);
   info.append(name, meta);
   const footer = el("div", "card-footer");
-  const download = el("a", "card-action");
-  download.href = video.downloadUrl;
-  download.download = video.name;
-  download.setAttribute("aria-label", `下载 ${video.name}`);
-  download.append(icon("download"), document.createTextNode("下载"));
+  const download = button("", "card-action download-action", () =>
+    openDownload(video),
+  );
+  download.dataset.videoId = video.id;
+  download.append(icon("download"), el("span", "download-label"));
+  updateDownloadButton(download, video);
   const actions = el("div", "card-footer-actions");
   actions.append(
     el("span", "file-size", formatSize(video.size)),
@@ -533,8 +543,9 @@ function openPlayer(video) {
   $("playerTitle").textContent = video.name;
   $("playerMeta").textContent =
     `${video.user} · ${video.date} · ${formatSize(video.size)}`;
-  $("playerDownload").href = video.downloadUrl;
-  $("playerDownload").download = video.name;
+  $("playerDownload").dataset.videoId = video.id;
+  $("playerDownload").onclick = () => openDownload(video);
+  updateDownloadButton($("playerDownload"), video);
   $("playbackError").hidden = true;
   $("player").src = video.url;
   $("playerDialog").showModal();
@@ -566,6 +577,182 @@ function closeOnBackdrop(dialog, callback) {
   });
 }
 closeOnBackdrop($("playerDialog"), () => $("playerDialog").close());
+function updateDownloadButton(control, video) {
+  const entry = downloads.get(video.id);
+  const busy =
+    entry?.requesting || ["queued", "processing"].includes(entry?.job?.status);
+  control.setAttribute("aria-busy", String(!!busy));
+  control.setAttribute(
+    "aria-label",
+    `${busy ? "查看下载进度" : "下载 H.264 MP4"}：${video.name}`,
+  );
+  control.title = busy ? "点击查看下载准备进度" : "下载 H.264 编码的 MP4";
+  control.querySelector(".download-label").textContent = busy
+    ? "查看进度"
+    : "下载";
+}
+function syncDownloadButtons(entry) {
+  document.querySelectorAll(".download-action").forEach((control) => {
+    if (control.dataset.videoId === entry.video.id)
+      updateDownloadButton(control, entry.video);
+  });
+}
+function stopDownloadPolling() {
+  clearTimeout(downloadPollTimer);
+  downloadPollController?.abort();
+  downloadPollController = null;
+  downloadGeneration++;
+}
+function renderDownload(entry) {
+  syncDownloadButtons(entry);
+  if (entry !== activeDownload || !$("downloadDialog").open) return;
+  const job = entry.job;
+  const ready = job?.status === "ready";
+  const failed = job?.status === "failed";
+  const error =
+    entry.error || (failed ? job.error || "视频处理失败，请重试。" : "");
+  const progress = Math.round(
+    Math.min(1, Math.max(0, Number(job?.progress) || 0)) * 100,
+  );
+  $("downloadName").textContent = entry.video.name;
+  $("downloadStatus").textContent = error
+    ? "暂时无法准备下载"
+    : ready
+      ? "H.264 MP4 已准备好"
+      : job?.status === "processing"
+        ? "正在检查编码并准备 H.264 MP4…"
+        : job?.status === "queued"
+          ? "正在排队，请稍候…"
+          : "正在准备下载…";
+  $("downloadProgress").value = ready ? 100 : progress;
+  $("downloadProgressGroup").hidden = ready || !!error;
+  $("downloadPercent").textContent = `${progress}%`;
+  $("downloadError").textContent = error;
+  $("downloadError").hidden = !error;
+  $("retryDownload").hidden = !error;
+  $("retryDownload").textContent = job && !failed ? "重新连接" : "重试";
+  $("readyDownload").hidden = !ready;
+  if (ready) {
+    $("readyDownload").href = job.downloadUrl;
+    $("readyDownload").download = job.name;
+  } else {
+    $("readyDownload").removeAttribute("href");
+  }
+  $("originalDownload").href = entry.video.downloadUrl;
+  $("originalDownload").download = entry.video.name;
+  $("downloadHint").textContent = ready
+    ? "已尝试开始下载。如果浏览器未弹出下载，请点击下方按钮。"
+    : error
+      ? "可以重试，或选择下载原文件。"
+      : "处理可能需要一些时间。关闭弹窗后仍会继续，再次点击下载可查看进度。";
+}
+function updateDownloadJob(entry, job) {
+  if (
+    !job?.id ||
+    !["queued", "processing", "ready", "failed"].includes(job.status) ||
+    (job.status === "ready" && !job.downloadUrl)
+  )
+    throw new Error("服务器返回了无效的下载状态，请重试。");
+  entry.job = job;
+  entry.error = "";
+}
+function continueDownload(entry) {
+  renderDownload(entry);
+  if (entry !== activeDownload || !$("downloadDialog").open) return;
+  if (entry.job?.status === "ready") {
+    if (autoStartDownload) {
+      autoStartDownload = false;
+      // A normal link streams the download without buffering the video in memory.
+      $("readyDownload").click();
+    }
+  } else if (
+    ["queued", "processing"].includes(entry.job?.status) &&
+    !entry.error
+  ) {
+    clearTimeout(downloadPollTimer);
+    downloadPollTimer = setTimeout(() => refreshDownload(entry), 1000);
+  }
+}
+async function requestDownload(entry) {
+  if (entry.requesting) return;
+  entry.requesting = true;
+  entry.job = null;
+  entry.error = "";
+  renderDownload(entry);
+  try {
+    const data = await api("/api/downloads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user: entry.video.user, name: entry.video.name }),
+    });
+    updateDownloadJob(entry, data.job);
+  } catch (error) {
+    entry.error = error.message;
+  } finally {
+    entry.requesting = false;
+    continueDownload(entry);
+  }
+}
+async function refreshDownload(entry) {
+  if (entry !== activeDownload || !$("downloadDialog").open || !entry.job)
+    return;
+  const generation = downloadGeneration;
+  const controller = new AbortController();
+  downloadPollController = controller;
+  try {
+    const data = await api(`/api/downloads/${encodeURIComponent(entry.job.id)}`, {
+      signal: controller.signal,
+    });
+    if (generation !== downloadGeneration) return;
+    updateDownloadJob(entry, data.job);
+    continueDownload(entry);
+  } catch (error) {
+    if (controller.signal.aborted || generation !== downloadGeneration) return;
+    // A service restart can discard a job; retrying should create it again.
+    if (error.status === 404) entry.job = null;
+    entry.error = error.message;
+    renderDownload(entry);
+  } finally {
+    if (downloadPollController === controller) downloadPollController = null;
+  }
+}
+function openDownload(video) {
+  stopDownloadPolling();
+  let entry = downloads.get(video.id);
+  if (!entry) {
+    entry = { video, job: null, requesting: false, error: "" };
+    downloads.set(video.id, entry);
+  }
+  entry.video = video;
+  activeDownload = entry;
+  autoStartDownload = true;
+  if ($("playerDialog").open) $("playerDialog").close();
+  if (!$("downloadDialog").open) $("downloadDialog").showModal();
+  renderDownload(entry);
+  if (entry.requesting) return;
+  // Revalidate ready jobs so changed source files and expired caches are handled.
+  if (entry.job?.status === "ready") requestDownload(entry);
+  else if (entry.job && entry.job.status !== "failed") refreshDownload(entry);
+  else if (!entry.error && !entry.job) requestDownload(entry);
+}
+$("closeDownload").addEventListener("click", () => $("downloadDialog").close());
+$("downloadDialog").addEventListener("close", () => {
+  stopDownloadPolling();
+  activeDownload = null;
+  autoStartDownload = false;
+});
+$("retryDownload").addEventListener("click", () => {
+  const entry = activeDownload;
+  if (!entry || entry.requesting) return;
+  stopDownloadPolling();
+  entry.error = "";
+  autoStartDownload = true;
+  if (entry.job?.status === "failed") entry.job = null;
+  renderDownload(entry);
+  if (entry.job) refreshDownload(entry);
+  else requestDownload(entry);
+});
+closeOnBackdrop($("downloadDialog"), () => $("downloadDialog").close());
 function today() {
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat("en-CA", {
@@ -605,7 +792,8 @@ function openUpload() {
     queue = [];
   $("uploadError").hidden = true;
   $("overallProgress").hidden = true;
-  $("uploadFooterHint").textContent = "重名文件会自动编号，已有视频会保留。";
+  $("uploadFooterHint").textContent =
+    "视频将保存为 H.264 MP4；上传后请等待编码检查和处理完成。";
   $("newUserFields").hidden = state.users.length > 0;
   updateUserOptions();
   renderQueue();
@@ -613,7 +801,7 @@ function openUpload() {
 }
 function closeUpload() {
   if (uploading) {
-    showToast("正在上传，请等待当前批次完成");
+    showToast("正在上传或处理视频，请等待当前批次完成");
     return;
   }
   $("uploadDialog").close();
@@ -737,7 +925,7 @@ function lockUpload(locked) {
   ].forEach((id) => ($(id).disabled = locked));
   renderQueue();
 }
-function uploadFile(item, user, onProgress) {
+function uploadFile(item, user, onProgress, onUploaded) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const p = new URLSearchParams({
@@ -753,6 +941,7 @@ function uploadFile(item, user, onProgress) {
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress(e.loaded, e.total);
     };
+    xhr.upload.onload = onUploaded;
     xhr.onerror = () => reject(new Error("网络连接中断，请重试"));
     xhr.onabort = () => reject(new Error("上传已中止"));
     xhr.onload = () => {
@@ -797,15 +986,27 @@ async function submitUploads(e) {
     item.status = "uploading";
     item.statusEl.className = "queue-file-status";
     item.statusEl.textContent = "正在准备上传…";
+    $("uploadButtonLabel").textContent = "正在上传…";
     $("progressLabel").textContent =
       `正在上传 ${i + 1} / ${pending.length} · ${item.file.name}`;
     try {
-      const data = await uploadFile(item, user, (loaded, total) => {
-        const progress = Math.round(((completed + loaded) / bytes) * 100);
-        $("uploadProgress").value = progress;
-        $("progressPercent").textContent = `${progress}%`;
-        item.statusEl.textContent = `上传中 · ${Math.round((loaded / total) * 100)}%`;
-      });
+      const data = await uploadFile(
+        item,
+        user,
+        (loaded, total) => {
+          const progress = Math.round(((completed + loaded) / bytes) * 100);
+          $("uploadProgress").value = progress;
+          $("progressPercent").textContent = `${progress}%`;
+          item.statusEl.textContent = `上传中 · ${Math.round((loaded / total) * 100)}%`;
+        },
+        () => {
+          item.statusEl.textContent = "上传完成，正在检查编码 / 转码…";
+          $("progressLabel").textContent =
+            `正在处理 ${i + 1} / ${pending.length} · ${item.file.name}`;
+          $("progressPercent").textContent = "处理中";
+          $("uploadButtonLabel").textContent = "正在处理…";
+        },
+      );
       item.status = "success";
       item.savedName = data.video.name;
       success++;
@@ -882,7 +1083,7 @@ $("closeUpload").addEventListener("click", closeUpload);
 $("uploadDialog").addEventListener("cancel", (e) => {
   if (uploading) {
     e.preventDefault();
-    showToast("正在上传，请等待当前批次完成");
+    showToast("正在上传或处理视频，请等待当前批次完成");
   }
 });
 closeOnBackdrop($("uploadDialog"), closeUpload);

@@ -16,6 +16,8 @@ import {
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { createVideoServer } from "../server.mjs";
+import { normalizeVideo } from "../media-converter.mjs";
+import { BufferSource, Input, MP4 } from "mediabunny";
 
 async function fixture(t, options = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "video-library-test-"));
@@ -28,6 +30,8 @@ async function fixture(t, options = {}) {
     videoDir,
     publicDir,
     timeZone: "Asia/Shanghai",
+    // These transport tests use arbitrary bytes; codec integration is tested below.
+    normalizeVideo: async () => ({ converted: false }),
     ...options,
   });
   server.listen(0, "127.0.0.1");
@@ -133,12 +137,12 @@ test("uploads preserve or replace valid dates, assign today, and never overwrite
   const noDate = await upload(base, "小明", "clip.mov");
   assert.equal(
     (await noDate.json()).video.name,
-    `${today.replaceAll("-", "")}_clip.mov`,
+    `${today.replaceAll("-", "")}_clip.mp4`,
   );
   const invalidDate = await upload(base, "小明", "20260230_clip.webm");
   assert.equal(
     (await invalidDate.json()).video.name,
-    `${today.replaceAll("-", "")}_clip.webm`,
+    `${today.replaceAll("-", "")}_clip_2.mp4`,
   );
   assert.equal(
     (await upload(base, "小明", "clip.mp4", "data", "2026-02-30")).status,
@@ -598,4 +602,223 @@ test("invalid saved processing data fails startup without overwriting the file",
     );
     assert.equal(await readFile(savedPath, "utf8"), content);
   }
+});
+
+async function startDownload(base, user, name, headers = {}) {
+  return fetch(`${base}/api/downloads`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify({ user, name }),
+  });
+}
+
+async function waitForDownload(base, job) {
+  for (let attempt = 0; attempt < 300; attempt++) {
+    if (["ready", "failed"].includes(job.status)) return job;
+    await delay(20);
+    job = (await (await fetch(`${base}/api/downloads/${job.id}`)).json()).job;
+  }
+  throw new Error("Download conversion did not finish");
+}
+
+async function assertCompatibleMp4(bytes) {
+  const input = new Input({ source: new BufferSource(bytes), formats: [MP4] });
+  try {
+    assert.equal(await input.getFormat(), MP4);
+    const videos = await input.getVideoTracks();
+    assert.ok(videos.length);
+    for (const video of videos) assert.equal(await video.getCodec(), "avc");
+    for (const audio of await input.getAudioTracks()) assert.equal(await audio.getCodec(), "aac");
+  } finally {
+    input.dispose();
+  }
+}
+
+const sample = (name) => readFile(new URL(`./fixtures/${name}`, import.meta.url));
+
+test("real uploads normalize VP9 to MP4, keep H264 bytes, resolve converted-name collisions and reject broken media", async (t) => {
+  const { base, videoDir } = await fixture(t, { normalizeVideo });
+  await createUser(base, "编解码");
+  const source = await sample("vp9-opus.webm");
+  const converted = await upload(base, "编解码", "20261020_sample.webm", source);
+  assert.equal(converted.status, 201);
+  const video = (await converted.json()).video;
+  assert.equal(video.name, "20261020_sample.mp4");
+  await assertCompatibleMp4(await readFile(path.join(videoDir, "编解码", video.name)));
+  const compatible = await sample("h264-aac.mp4");
+  const copied = await upload(base, "编解码", "20261020_sample.mp4", compatible);
+  assert.equal(copied.status, 201);
+  const copy = (await copied.json()).video;
+  assert.equal(copy.name, "20261020_sample_2.mp4");
+  assert.deepEqual(await readFile(path.join(videoDir, "编解码", copy.name)), compatible);
+  assert.equal((await upload(base, "编解码", "bad.mp4", "not a video")).status, 422);
+  assert.deepEqual((await readdir(path.join(videoDir, "编解码"))).sort(), [video.name, copy.name].sort());
+});
+
+test("legacy VP9 downloads convert once, retain the original, reuse cache across restart and invalidate changed sources", async (t) => {
+  let calls = 0;
+  const countingConverter = async (options) => { calls++; return normalizeVideo(options); };
+  const { base, videoDir, publicDir, server } = await fixture(t, { normalizeVideo: countingConverter });
+  await mkdir(path.join(videoDir, "legacy"));
+  const source = await sample("vp9-opus.webm");
+  const sourcePath = path.join(videoDir, "legacy", "old.webm");
+  await writeFile(sourcePath, source);
+  const responses = await Promise.all(Array.from({ length: 3 }, () => startDownload(base, "legacy", "old.webm")));
+  assert.ok(responses.every((response) => response.status === 202));
+  const jobs = await Promise.all(responses.map(async (response) => (await response.json()).job));
+  assert.equal(new Set(jobs.map((job) => job.id)).size, 1);
+  const ready = await waitForDownload(base, jobs[0]);
+  assert.equal(ready.status, "ready");
+  assert.equal(calls, 1);
+  const download = await fetch(`${base}${ready.downloadUrl}`);
+  assert.equal(download.headers.get("content-type"), "video/mp4");
+  assert.match(download.headers.get("content-disposition"), /old\.mp4/);
+  const result = Buffer.from(await download.arrayBuffer());
+  await assertCompatibleMp4(result);
+  assert.deepEqual(await readFile(sourcePath), source);
+  const range = await fetch(`${base}${ready.downloadUrl}`, { headers: { Range: "bytes=0-15" } });
+  assert.equal(range.status, 206);
+  assert.deepEqual(Buffer.from(await range.arrayBuffer()), result.subarray(0, 16));
+  assert.equal((await (await fetch(`${base}/api/library`)).json()).videos.length, 1);
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+  const restarted = await createVideoServer({ videoDir, publicDir, normalizeVideo: countingConverter });
+  restarted.listen(0, "127.0.0.1");
+  await once(restarted, "listening");
+  t.after(async () => {
+    restarted.closeAllConnections();
+    await new Promise((resolve) => restarted.close(resolve));
+  });
+  const secondBase = `http://127.0.0.1:${restarted.address().port}`;
+  const cached = await waitForDownload(secondBase, (await (await startDownload(secondBase, "legacy", "old.webm")).json()).job);
+  assert.equal(cached.status, "ready");
+  assert.equal(calls, 1);
+  await writeFile(sourcePath, await sample("vp9-silent-odd.webm"));
+  const changed = await waitForDownload(secondBase, (await (await startDownload(secondBase, "legacy", "old.webm")).json()).job);
+  assert.equal(changed.status, "ready");
+  assert.notEqual(changed.id, ready.id);
+  assert.equal(calls, 2);
+});
+
+test("compatible downloads bypass encoding and reject changed source files", async (t) => {
+  const { base, videoDir } = await fixture(t, { normalizeVideo });
+  await mkdir(path.join(videoDir, "user"));
+  const bytes = await sample("h264-aac.mp4");
+  const sourcePath = path.join(videoDir, "user", "clip.mp4");
+  await writeFile(sourcePath, bytes);
+  const job = await waitForDownload(base, (await (await startDownload(base, "user", "clip.mp4")).json()).job);
+  assert.equal(job.status, "ready");
+  assert.deepEqual(Buffer.from(await (await fetch(`${base}${job.downloadUrl}`)).arrayBuffer()), bytes);
+  assert.deepEqual(await readdir(path.join(videoDir, ".transcoded")), []);
+  await writeFile(sourcePath, "changed");
+  assert.equal((await fetch(`${base}${job.downloadUrl}`)).status, 409);
+});
+
+test("download jobs reject foreign writes and symlinks, expose conversion errors and permit retry", async (t) => {
+  let fail = true;
+  const { base, videoDir, root } = await fixture(t, {
+    normalizeVideo: async ({ outputPath }) => {
+      await writeFile(outputPath, "partial output");
+      if (fail) throw new Error("codec unavailable");
+      return { converted: true };
+    },
+  });
+  await mkdir(path.join(videoDir, "user"));
+  await writeFile(path.join(videoDir, "user", "clip.webm"), "source");
+  await writeFile(path.join(root, "secret.mp4"), "secret");
+  await symlink(path.join(root, "secret.mp4"), path.join(videoDir, "user", "link.mp4"));
+  assert.equal((await startDownload(base, "user", "clip.webm", { Origin: "https://foreign.example" })).status, 403);
+  assert.equal((await startDownload(base, "user", "link.mp4")).status, 404);
+  assert.equal((await startDownload(base, "user", "../secret.mp4")).status, 400);
+  assert.equal((await startDownload(base, "user", "missing.mp4")).status, 404);
+  const job = await waitForDownload(base, (await (await startDownload(base, "user", "clip.webm")).json()).job);
+  assert.equal(job.status, "failed");
+  assert.ok(job.error);
+  assert.equal((await fetch(`${base}/api/downloads/${job.id}/file`)).status, 409);
+  // Failure is visible only after cleanup completes in the queue.
+  await delay(20);
+  assert.deepEqual(await readdir(path.join(videoDir, ".transcoded")), []);
+  fail = false;
+  const retried = await waitForDownload(base, (await (await startDownload(base, "user", "clip.webm")).json()).job);
+  assert.equal(retried.status, "ready");
+});
+
+test("uploads and downloads share a serial conversion queue and never publish a failed upload", async (t) => {
+  let active = 0;
+  let peak = 0;
+  const { base, videoDir } = await fixture(t, {
+    normalizeVideo: async ({ handle }) => {
+      active++;
+      peak = Math.max(peak, active);
+      await delay(30);
+      active--;
+      if ((await handle.readFile("utf8")) === "bad") throw new Error("bad input");
+      return { converted: false };
+    },
+  });
+  await createUser(base, "user");
+  await writeFile(path.join(videoDir, "user", "old.mp4"), "good");
+  const [a, b, download] = await Promise.all([
+    upload(base, "user", "good.mp4", "good"),
+    upload(base, "user", "bad.mp4", "bad"),
+    startDownload(base, "user", "old.mp4"),
+  ]);
+  assert.equal(a.status, 201);
+  assert.equal(b.status, 422);
+  assert.equal((await waitForDownload(base, (await download.json()).job)).status, "ready");
+  assert.equal(peak, 1);
+  assert.equal((await readdir(path.join(videoDir, "user"))).length, 2);
+});
+
+test("disconnecting during upload conversion removes source and output without publishing", async (t) => {
+  const started = Promise.withResolvers();
+  const { base, videoDir } = await fixture(t, {
+    normalizeVideo: async ({ outputPath, signal }) => {
+      await writeFile(outputPath, "partial");
+      started.resolve();
+      await new Promise((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        if (signal.aborted) reject(signal.reason);
+      });
+      return { converted: true };
+    },
+  });
+  await createUser(base, "user");
+  const request = http.request(`${base}/api/upload?user=user&name=cancel.webm`, { method: "POST" });
+  request.on("error", () => {});
+  request.end("video");
+  await started.promise;
+  request.destroy();
+  let files;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    files = await readdir(path.join(videoDir, "user"));
+    if (!files.length) break;
+    await delay(10);
+  }
+  assert.deepEqual(files, []);
+  assert.equal((await (await fetch(`${base}/api/library`)).json()).videos.length, 0);
+});
+
+test("expired download cache is cleaned and ready jobs regenerate missing files", async (t) => {
+  let calls = 0;
+  const { base, videoDir } = await fixture(t, {
+    normalizeVideo: async ({ outputPath }) => {
+      calls++;
+      await writeFile(outputPath, "converted");
+      return { converted: true };
+    },
+  });
+  await createUser(base, "user");
+  await writeFile(path.join(videoDir, "user", "one.webm"), "one");
+  await writeFile(path.join(videoDir, "user", "two.webm"), "two");
+  const first = await waitForDownload(base, (await (await startDownload(base, "user", "one.webm")).json()).job);
+  const cachedPath = path.join(videoDir, ".transcoded", `${first.id}.mp4`);
+  const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+  await utimes(cachedPath, old, old);
+  await waitForDownload(base, (await (await startDownload(base, "user", "two.webm")).json()).job);
+  assert.equal((await fetch(`${base}${first.downloadUrl}`)).status, 404);
+  const regenerated = await waitForDownload(base, (await (await startDownload(base, "user", "one.webm")).json()).job);
+  assert.equal(regenerated.status, "ready");
+  assert.equal(calls, 3);
+  assert.equal((await fetch(`${base}${regenerated.downloadUrl}`)).status, 200);
 });
