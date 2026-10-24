@@ -840,6 +840,25 @@ input::placeholder {
 .management-toolbar select {
   max-width: 150px;
 }
+.management-results {
+  flex-wrap: wrap;
+}
+.management-bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.management-selection-count {
+  color: #817a8b;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.management-bulk-actions .button {
+  min-height: 34px;
+  padding: 7px 11px;
+  font-size: 11px;
+}
 .management-table-wrap {
   width: 100%;
   overflow-x: auto;
@@ -853,7 +872,7 @@ input::placeholder {
 }
 .management-table {
   width: 100%;
-  min-width: 840px;
+  min-width: 880px;
   table-layout: fixed;
   border-collapse: collapse;
   text-align: left;
@@ -872,22 +891,38 @@ input::placeholder {
   font-weight: 500;
 }
 .management-table th:nth-child(1) {
-  width: 36%;
-}
-.management-table th:nth-child(2) {
-  width: 17%;
+  width: 48px;
 }
 .management-table th:nth-child(3) {
-  width: 13%;
+  width: 17%;
 }
 .management-table th:nth-child(4) {
-  width: 10%;
+  width: 13%;
 }
 .management-table th:nth-child(5) {
-  width: 14%;
+  width: 10%;
 }
 .management-table th:nth-child(6) {
+  width: 14%;
+}
+.management-table th:nth-child(7) {
   width: 10%;
+}
+.management-table .management-select {
+  padding-left: 15px;
+  padding-right: 15px;
+  text-align: center;
+}
+.management-checkbox {
+  display: block;
+  width: 18px;
+  height: 18px;
+  margin: 0 auto;
+  accent-color: var(--pink-dark);
+  cursor: pointer;
+}
+.management-checkbox:disabled {
+  cursor: not-allowed;
 }
 .management-table td {
   border-top: 1px solid #f0edf2;
@@ -895,9 +930,28 @@ input::placeholder {
 .management-table tbody tr:hover {
   background: #fdfbfd;
 }
+.management-table tbody tr.is-selected {
+  background: #fff5f8;
+}
+.management-table tbody tr.is-selected:hover {
+  background: #fff0f4;
+}
 .management-name {
   overflow-wrap: anywhere;
   font-weight: 500;
+}
+.management-title {
+  display: block;
+  width: 100%;
+  padding: 4px 0;
+  font: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.management-title:hover {
+  color: var(--pink-dark);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .management-group {
   overflow: hidden;
@@ -972,6 +1026,42 @@ input::placeholder {
   margin: 12px 0 0;
   color: #8c8796;
   font-size: 11px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.delete-list {
+  max-height: min(28dvh, 220px);
+  margin: 16px 0 0;
+  padding: 0;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfafc;
+  list-style: none;
+}
+.delete-list li {
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.delete-list li + li {
+  border-top: 1px solid var(--line);
+}
+.delete-failure-name {
+  display: block;
+  font-weight: 500;
+}
+.delete-failure-reason {
+  display: block;
+  margin-top: 4px;
+  color: #bc3e5b;
+  font-size: 11px;
+}
+.delete-progress {
+  margin: 16px 0 0;
+  color: #817a8b;
+  font-size: 12px;
   line-height: 1.7;
   overflow-wrap: anywhere;
 }
@@ -1557,6 +1647,17 @@ dialog::backdrop {
   }
   .management-toolbar .toolbar-actions {
     gap: 8px;
+  }
+  .management-bulk-actions {
+    width: 100%;
+    gap: 8px;
+  }
+  .management-selection-count {
+    margin-right: auto;
+  }
+  .management-bulk-actions .button {
+    padding-left: 9px;
+    padding-right: 9px;
   }
   .management-table-wrap {
     border-radius: 9px;

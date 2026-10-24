@@ -143,10 +143,18 @@
             <button id="manageRefresh" class="icon-button" title="刷新管理列表" aria-label="刷新管理列表"><span data-icon="refresh"></span></button>
           </div>
         </div>
-        <div class="results-line"><span id="manageSummary" role="status" aria-live="polite">正在读取视频…</span></div>
+        <div class="results-line management-results">
+          <span id="manageSummary" role="status" aria-live="polite">正在读取视频…</span>
+          <div class="management-bulk-actions">
+            <span id="manageSelectionCount" class="management-selection-count" role="status" aria-live="polite">已选择 0 个</span>
+            <button id="manageClearSelection" class="button secondary" type="button" disabled>取消选择</button>
+            <button id="manageDeleteSelected" class="button danger" type="button" disabled><span data-icon="trash"></span>批量删除</button>
+          </div>
+        </div>
         <div id="manageTableWrap" class="management-table-wrap" role="region" aria-label="视频管理列表，可横向滚动" tabindex="0" hidden>
           <table class="management-table" aria-label="视频管理">
             <thead><tr>
+              <th scope="col" class="management-select"><input id="manageSelectPage" class="management-checkbox" type="checkbox" aria-label="全选当前页" title="全选当前页" /></th>
               <th scope="col">名字</th><th scope="col">分组</th><th scope="col">时间</th><th scope="col">大小</th><th scope="col">是否已处理</th><th scope="col">操作</th>
             </tr></thead>
             <tbody id="manageRows"></tbody>
@@ -206,6 +214,8 @@
         <p id="deleteWarning" class="delete-warning">视频将从服务器永久删除，无法撤销。</p>
         <strong id="deleteName" class="delete-name"></strong>
         <p id="deleteMeta" class="delete-meta"></p>
+        <ul id="deleteList" class="delete-list" aria-label="待删除视频" hidden></ul>
+        <p id="deleteProgress" class="delete-progress" role="status" aria-live="polite" hidden></p>
         <p id="deleteError" class="error-message" role="alert" hidden></p>
       </div>
       <div class="dialog-footer delete-dialog-actions">

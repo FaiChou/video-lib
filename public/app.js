@@ -70,8 +70,9 @@ const management = {
   sort: "desc",
   page: 1,
   pageSize: 48,
+  selected: new Set(),
 };
-let deleteTarget = null,
+let deleteTargets = [],
   deleting = false;
 const deletedChanges = new Map();
 let loadGeneration = 0,
@@ -488,6 +489,10 @@ function renderLibrary() {
     .forEach((v) => thumbnails.observe(v));
 }
 function renderManagement() {
+  const existing = new Set(state.videos.map((video) => video.id));
+  for (const id of management.selected) {
+    if (!existing.has(id)) management.selected.delete(id);
+  }
   $("manageCount").textContent = String(state.videos.length);
   const allUsers = el("option", "", "全部分组");
   allUsers.value = "";
@@ -520,7 +525,22 @@ function renderManagement() {
     : "共 0 个视频";
   $("manageRows").replaceChildren(...(hasVideos ? videos.slice(start, start + management.pageSize) : []).map((video) => {
     const row = el("tr");
-    const name = el("td", "management-name", video.name);
+    const selectCell = el("td", "management-select");
+    const select = el("input", "management-checkbox");
+    select.type = "checkbox";
+    select.dataset.videoId = video.id;
+    select.setAttribute("aria-label", `选择 ${video.user}/${video.name}`);
+    select.addEventListener("change", () => {
+      if (select.checked) management.selected.add(video.id);
+      else management.selected.delete(video.id);
+      syncManagementSelection();
+    });
+    selectCell.append(select);
+    const name = el("td", "management-name");
+    const preview = button(video.name, "management-title", () => openPlayer(video));
+    preview.title = video.name;
+    preview.setAttribute("aria-label", `预览 ${video.user}/${video.name}`);
+    name.append(preview);
     const group = el("td", "management-group", video.user);
     group.title = video.user;
     const date = el("time", "", video.date);
@@ -531,12 +551,13 @@ function renderManagement() {
     const statusCell = el("td");
     statusCell.append(el("span", `management-status${video.processed ? " is-processed" : ""}`, video.processed ? "已处理" : "未处理"));
     const actionCell = el("td");
-    const remove = button("删除", "delete-action", () => openDelete(video), "trash");
+    const remove = button("删除", "delete-action", () => openDelete([video]), "trash");
     remove.setAttribute("aria-label", `删除 ${video.user}/${video.name}`);
     actionCell.append(remove);
-    row.append(name, group, dateCell, el("td", "management-size", formatSize(video.size)), statusCell, actionCell);
+    row.append(selectCell, name, group, dateCell, el("td", "management-size", formatSize(video.size)), statusCell, actionCell);
     return row;
   }));
+  syncManagementSelection();
   if (!hasVideos) {
     const filtered = management.search || management.user || management.processed !== "all";
     $("manageEmpty").replaceChildren(
@@ -547,6 +568,7 @@ function renderManagement() {
         management.user = "";
         management.processed = "all";
         management.page = 1;
+        management.selected.clear();
         $("manageSearch").value = "";
         $("manageProcessed").value = "all";
         renderManagement();
@@ -560,16 +582,49 @@ function renderManagement() {
     $("manageView").scrollIntoView({ behavior: "smooth", block: "start" });
   });
 }
+function syncManagementSelection() {
+  const checkboxes = [...$("manageRows").querySelectorAll(".management-checkbox")];
+  let checked = 0;
+  for (const checkbox of checkboxes) {
+    checkbox.checked = management.selected.has(checkbox.dataset.videoId);
+    checkbox.closest("tr").classList.toggle("is-selected", checkbox.checked);
+    if (checkbox.checked) checked++;
+  }
+  $("manageSelectPage").checked = checkboxes.length > 0 && checked === checkboxes.length;
+  $("manageSelectPage").indeterminate = checked > 0 && checked < checkboxes.length;
+  $("manageSelectPage").disabled = !checkboxes.length || deleting;
+  $("manageSelectionCount").textContent = `已选择 ${management.selected.size} 个`;
+  $("manageClearSelection").disabled = !management.selected.size || deleting;
+  $("manageDeleteSelected").disabled = !management.selected.size || deleting || !!state.loadError;
+}
 function renderCurrentView() {
   if (state.view === "manage") renderManagement();
   else if (state.view === "library") renderLibrary();
 }
-function openDelete(video) {
-  if (deleting) return;
-  deleteTarget = video;
-  $("deleteName").textContent = video.name;
-  $("deleteMeta").textContent = `${video.user} · ${video.date} · ${formatSize(video.size)} · ${video.processed ? "已处理" : "未处理"}`;
+function renderDeleteTargets(failures = []) {
+  const count = deleteTargets.length;
+  $("deleteTitle").textContent = count === 1 ? "删除这个视频？" : `删除这 ${count} 个视频？`;
+  $("deleteButtonLabel").textContent = `确认删除 ${count} 个视频`;
+  const video = deleteTargets[0];
+  $("deleteName").textContent = count === 1 ? video.name : `已选择 ${count} 个视频`;
+  $("deleteMeta").textContent = count === 1
+    ? `${video.user} · ${video.date} · ${formatSize(video.size)} · ${video.processed ? "已处理" : "未处理"}`
+    : `共 ${new Set(deleteTargets.map((item) => item.user)).size} 个分组 · ${formatSize(deleteTargets.reduce((sum, item) => sum + item.size, 0))}`;
+  $("deleteList").hidden = count === 1 && !failures.length;
+  $("deleteList").replaceChildren(...deleteTargets.map((item) => {
+    const entry = el("li");
+    entry.append(el("span", "delete-failure-name", `${item.user}/${item.name}`));
+    const failure = failures.find((failed) => failed.video.id === item.id);
+    if (failure) entry.append(el("span", "delete-failure-reason", failure.message));
+    return entry;
+  }));
+}
+function openDelete(videos) {
+  if (deleting || !videos.length) return;
+  deleteTargets = [...videos];
+  renderDeleteTargets();
   $("deleteError").hidden = true;
+  $("deleteProgress").hidden = true;
   $("deleteDialog").showModal();
   $("cancelDelete").focus();
 }
@@ -580,10 +635,8 @@ function removeDeletedVideo(video) {
   deletedChanges.set(video.id, ++processedRevision);
   processedChanges.delete(video.id);
   downloads.delete(video.id);
+  management.selected.delete(video.id);
   state.videos = state.videos.filter((item) => item.id !== video.id);
-  updateUserCounts();
-  renderCurrentView();
-  updateUserOptions();
 }
 function updateUserCounts() {
   const counts = new Map();
@@ -591,42 +644,60 @@ function updateUserCounts() {
   state.users = state.users.map((user) => ({ ...user, count: counts.get(user.name) || 0 }));
 }
 async function confirmDelete() {
-  if (!deleteTarget || deleting) return;
-  const video = deleteTarget;
+  if (!deleteTargets.length || deleting) return;
+  const targets = [...deleteTargets];
   deleting = true;
   for (const id of ["confirmDelete", "cancelDelete", "closeDelete"]) $(id).disabled = true;
   $("deleteDialog").setAttribute("aria-busy", "true");
   $("deleteButtonLabel").textContent = "正在删除…";
   $("deleteError").hidden = true;
-  let removed = false;
-  let message;
+  $("deleteProgress").hidden = false;
+  syncManagementSelection();
+  const failures = [];
+  let removed = 0;
+  let missing = 0;
   try {
-    await api("/api/videos", {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user: video.user, name: video.name }),
-    });
-    removed = true;
-    message = `已删除 ${video.name}`;
-  } catch (error) {
-    if (error.status === 404) {
-      removed = true;
-      message = "视频已不存在，已从列表移除";
-    } else {
-      $("deleteError").textContent = `删除失败：${error.message}`;
-      $("deleteError").hidden = false;
+    // Reuse the validated single-video endpoint and track each result so a
+    // failed item never hides successful deletions or gets silently discarded.
+    for (const [index, video] of targets.entries()) {
+      $("deleteProgress").textContent = `正在删除 ${index + 1} / ${targets.length}：${video.name}`;
+      try {
+        await api("/api/videos", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user: video.user, name: video.name }),
+        });
+        removeDeletedVideo(video);
+        removed++;
+      } catch (error) {
+        if (error.status === 404) {
+          removeDeletedVideo(video);
+          missing++;
+        } else {
+          failures.push({ video, message: error.message });
+        }
+      }
     }
   } finally {
     deleting = false;
     for (const id of ["confirmDelete", "cancelDelete", "closeDelete"]) $(id).disabled = false;
     $("deleteDialog").setAttribute("aria-busy", "false");
-    $("deleteButtonLabel").textContent = "确认删除";
+    updateUserCounts();
+    renderCurrentView();
+    updateUserOptions();
   }
-  if (removed) {
+  const result = `已删除 ${removed} 个视频${missing ? `，${missing} 个已不存在并移出列表` : ""}`;
+  if (failures.length) {
+    deleteTargets = failures.map((failure) => failure.video);
+    renderDeleteTargets(failures);
+    $("deleteProgress").textContent = `${result}，${failures.length} 个删除失败。`;
+    $("deleteError").textContent = "以下视频未能删除，请查看原因后重试。";
+    $("deleteError").hidden = false;
+    $("deleteButtonLabel").textContent = `重试删除 ${failures.length} 个视频`;
+  } else {
     closeDelete();
-    removeDeletedVideo(video);
     $("manageSearch").focus();
-    showToast(message);
+    showToast(result);
   }
 }
 function updateUserOptions() {
@@ -1327,7 +1398,7 @@ document.addEventListener("drop", (e) => {
   if (e.dataTransfer.types.includes("Files")) e.preventDefault();
 });
 window.addEventListener("beforeunload", (e) => {
-  if (uploading) {
+  if (uploading || deleting) {
     e.preventDefault();
     e.returnValue = "";
   }
@@ -1370,6 +1441,20 @@ $("refreshButton").addEventListener("click", () =>
   loadLibrary({ notify: true }),
 );
 $("manageRefresh").addEventListener("click", () => loadLibrary({ notify: true }));
+$("manageSelectPage").addEventListener("change", () => {
+  for (const checkbox of $("manageRows").querySelectorAll(".management-checkbox")) {
+    if ($("manageSelectPage").checked) management.selected.add(checkbox.dataset.videoId);
+    else management.selected.delete(checkbox.dataset.videoId);
+  }
+  syncManagementSelection();
+});
+$("manageClearSelection").addEventListener("click", () => {
+  management.selected.clear();
+  syncManagementSelection();
+});
+$("manageDeleteSelected").addEventListener("click", () => {
+  openDelete(state.videos.filter((video) => management.selected.has(video.id)));
+});
 for (const [id, key, event] of [
   ["manageSearch", "search", "input"],
   ["manageUser", "user", "change"],
@@ -1379,6 +1464,7 @@ for (const [id, key, event] of [
 ]) {
   $(id).addEventListener(event, () => {
     management[key] = key === "pageSize" ? Number($(id).value) : $(id).value.trim();
+    if (["search", "user", "processed"].includes(key)) management.selected.clear();
     management.page = 1;
     renderManagement();
   });
@@ -1389,7 +1475,7 @@ $("closeDelete").addEventListener("click", closeDelete);
 $("deleteDialog").addEventListener("cancel", (event) => {
   if (deleting) event.preventDefault();
 });
-$("deleteDialog").addEventListener("close", () => { deleteTarget = null; });
+$("deleteDialog").addEventListener("close", () => { deleteTargets = []; });
 closeOnBackdrop($("deleteDialog"), closeDelete);
 window.addEventListener("hashchange", route);
 for (let i = 0; i < 8; i++)
