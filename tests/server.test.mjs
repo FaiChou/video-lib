@@ -71,6 +71,14 @@ async function setProcessed(base, video, processed, extraHeaders = {}) {
   });
 }
 
+async function deleteVideo(base, video, extraHeaders = {}) {
+  return fetch(`${base}/api/videos`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json", ...extraHeaders },
+    body: JSON.stringify({ user: video.user, name: video.name }),
+  });
+}
+
 test("library discovers only supported real videos, sorts by date and uses Shanghai mtime fallback", async (t) => {
   const { base, videoDir, root } = await fixture(t);
   await mkdir(path.join(videoDir, "selena"));
@@ -603,6 +611,191 @@ test("invalid saved processing data fails startup without overwriting the file",
     );
     assert.equal(await readFile(savedPath, "utf8"), content);
   }
+});
+
+test("management routes serve the app and deletion removes only the selected video and its saved status", async (t) => {
+  const { base, videoDir } = await fixture(t);
+  for (const route of ["/manage", "/manage/"])
+    assert.equal(await (await fetch(`${base}${route}`)).text(), "<h1>video library</h1>");
+  await createUser(base, "小明");
+  const video = (await (await upload(base, "小明", "20261020_旅行.mp4")).json()).video;
+  const kept = (await (await upload(base, "小明", "20261020_keep.mp4")).json()).video;
+  await setProcessed(base, video, true);
+  await setProcessed(base, kept, true);
+  const response = await deleteVideo(base, video);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { deleted: { user: video.user, name: video.name } });
+  assert.deepEqual(await readdir(path.join(videoDir, "小明")), [kept.name]);
+  const library = await (await fetch(`${base}/api/library`)).json();
+  assert.deepEqual(library.videos.map((entry) => entry.name), [kept.name]);
+  assert.deepEqual(library.users, [{ name: "小明", count: 1 }]);
+  assert.equal(library.videos[0].processed, true);
+  assert.deepEqual(JSON.parse(await readFile(path.join(videoDir, ".processed.json"), "utf8")), {
+    [`小明/${kept.name}`]: true,
+  });
+  assert.equal((await fetch(`${base}${video.url}`)).status, 404);
+  assert.equal((await deleteVideo(base, video)).status, 404);
+  const replacement = (await (await upload(base, "小明", video.name)).json()).video;
+  assert.equal(replacement.name, video.name);
+  assert.equal(replacement.processed, false);
+});
+
+test("deletion rejects invalid paths, symlinks, foreign writes and malformed requests without touching source files", async (t) => {
+  const { base, videoDir, root } = await fixture(t);
+  await createUser(base, "user");
+  const video = (await (await upload(base, "user", "20261020_clip.mp4")).json()).video;
+  await writeFile(path.join(root, "secret.mp4"), "secret");
+  await symlink(path.join(root, "secret.mp4"), path.join(videoDir, "user", "link.mp4"));
+  await symlink(path.join(videoDir, "user"), path.join(videoDir, "alias"));
+  await mkdir(path.join(videoDir, "user", "directory.mp4"));
+  for (const [user, name, expected] of [
+    ["user", "missing.mp4", 404], ["missing", video.name, 404],
+    ["../outside", video.name, 400], ["user", "../secret.mp4", 400],
+    ["user", "notes.txt", 404], ["user", "link.mp4", 404],
+    ["user", "directory.mp4", 404], ["alias", video.name, 400],
+  ]) assert.equal((await deleteVideo(base, { user, name })).status, expected);
+  for (const body of ["null", "[]", "{}", "{"])
+    assert.equal((await fetch(`${base}/api/videos`, {
+      method: "DELETE", headers: { "Content-Type": "application/json" }, body,
+    })).status, 400);
+  assert.equal((await fetch(`${base}/api/videos`, { method: "DELETE", body: "{}" })).status, 415);
+  for (const headers of [{ Origin: "https://foreign.example" }, { "Sec-Fetch-Site": "cross-site" }])
+    assert.equal((await deleteVideo(base, video, headers)).status, 403);
+  assert.equal(await readFile(path.join(root, "secret.mp4"), "utf8"), "secret");
+  assert.equal(await readFile(path.join(videoDir, "user", video.name), "utf8"), "video bytes");
+});
+
+test("concurrent deletion and processing saves preserve remaining states and never recreate deleted records", async (t) => {
+  const { base, videoDir } = await fixture(t);
+  await createUser(base, "user");
+  const videos = await Promise.all(Array.from({ length: 8 }, async (_, index) =>
+    (await (await upload(base, "user", `20261020_${index}.mp4`)).json()).video));
+  await Promise.all(videos.map((video) => setProcessed(base, video, true)));
+  const removed = videos.slice(0, 4);
+  const kept = videos.slice(4);
+  const results = await Promise.all([
+    ...removed.map((video) => deleteVideo(base, video)),
+    ...kept.map((video) => setProcessed(base, video, false)),
+  ]);
+  assert.ok(results.every((response) => response.status === 200));
+  const lateSaves = await Promise.all(removed.map((video) => setProcessed(base, video, true)));
+  assert.ok(lateSaves.every((response) => response.status === 404));
+  assert.deepEqual(JSON.parse(await readFile(path.join(videoDir, ".processed.json"), "utf8")),
+    Object.fromEntries(kept.map((video) => [`user/${video.name}`, false])));
+  assert.deepEqual((await readdir(path.join(videoDir, "user"))).sort(), kept.map((video) => video.name).sort());
+  assert.deepEqual((await readdir(videoDir)).sort(), [".processed.json", "user"]);
+});
+
+test("a failed deletion status write leaves the video intact and deletion can be retried", async (t) => {
+  const { base, videoDir } = await fixture(t);
+  await createUser(base, "user");
+  const video = (await (await upload(base, "user", "20261020_clip.mp4")).json()).video;
+  await setProcessed(base, video, true);
+  const savedPath = path.join(videoDir, ".processed.json");
+  await rm(savedPath);
+  await mkdir(savedPath);
+  const errors = t.mock.method(console, "error", () => {});
+  assert.equal((await deleteVideo(base, video)).status, 500);
+  assert.equal(errors.mock.callCount(), 1);
+  assert.equal(await readFile(path.join(videoDir, "user", video.name), "utf8"), "video bytes");
+  assert.equal((await (await fetch(`${base}/api/library`)).json()).videos[0].processed, true);
+  await rm(savedPath, { recursive: true });
+  assert.equal((await deleteVideo(base, video)).status, 200);
+  assert.deepEqual(JSON.parse(await readFile(savedPath, "utf8")), {});
+  assert.deepEqual(await readdir(path.join(videoDir, "user")), []);
+});
+
+test("deletion removes converted cache and invalidates ready downloads", async (t) => {
+  const { base, videoDir } = await fixture(t, {
+    normalizeVideo: async ({ outputPath }) => {
+      await writeFile(outputPath, "converted");
+      return { converted: true };
+    },
+  });
+  await createUser(base, "user");
+  const video = { user: "user", name: "clip.webm" };
+  await writeFile(path.join(videoDir, "user", video.name), "source");
+  const job = await waitForDownload(base, (await (await startDownload(base, video.user, video.name)).json()).job);
+  assert.equal(job.status, "ready");
+  assert.deepEqual(await readdir(path.join(videoDir, ".transcoded")), [`${job.id}.mp4`]);
+  assert.equal((await deleteVideo(base, video)).status, 200);
+  assert.deepEqual(await readdir(path.join(videoDir, ".transcoded")), []);
+  assert.equal((await fetch(`${base}${job.downloadUrl}`)).status, 404);
+  assert.equal((await fetch(`${base}/api/downloads/${job.id}`)).status, 404);
+  assert.equal((await startDownload(base, video.user, video.name)).status, 404);
+});
+
+test("deletion rejects active download checks and queued conversions until they complete", async (t) => {
+  const checkGate = Promise.withResolvers();
+  const checkStarted = Promise.withResolvers();
+  const conversionGate = Promise.withResolvers();
+  const conversionStarted = Promise.withResolvers();
+  let checks = 0;
+  const { base, videoDir } = await fixture(t, {
+    isCompatibleVideo: async () => {
+      if (checks++ === 0) { checkStarted.resolve(); await checkGate.promise; }
+      return false;
+    },
+    normalizeVideo: async () => {
+      conversionStarted.resolve();
+      await conversionGate.promise;
+      return { converted: false };
+    },
+  });
+  await createUser(base, "user");
+  const first = { user: "user", name: "first.mp4" };
+  const second = { user: "user", name: "second.mp4" };
+  await writeFile(path.join(videoDir, "user", first.name), "first");
+  await writeFile(path.join(videoDir, "user", second.name), "second");
+  let firstJob;
+  let secondJob;
+  const pending = startDownload(base, first.user, first.name);
+  try {
+    await checkStarted.promise;
+    assert.equal((await deleteVideo(base, first)).status, 409);
+    checkGate.resolve();
+    firstJob = (await (await pending).json()).job;
+    await conversionStarted.promise;
+    secondJob = (await (await startDownload(base, second.user, second.name)).json()).job;
+    assert.equal(secondJob.status, "queued");
+    assert.equal((await deleteVideo(base, first)).status, 409);
+    assert.equal((await deleteVideo(base, second)).status, 409);
+  } finally {
+    checkGate.resolve();
+    conversionGate.resolve();
+    if (firstJob) await waitForDownload(base, firstJob);
+    if (secondJob) await waitForDownload(base, secondJob);
+  }
+  assert.equal((await deleteVideo(base, first)).status, 200);
+  assert.equal((await deleteVideo(base, second)).status, 200);
+});
+
+test("deletion clears a disk cache after restart without needing an in-memory download job", async (t) => {
+  const { base, videoDir, publicDir, server } = await fixture(t, {
+    normalizeVideo: async ({ outputPath }) => {
+      await writeFile(outputPath, "converted");
+      return { converted: true };
+    },
+  });
+  await createUser(base, "user");
+  const video = { user: "user", name: "legacy.webm" };
+  await writeFile(path.join(videoDir, "user", video.name), "source");
+  const job = await waitForDownload(base, (await (await startDownload(base, video.user, video.name)).json()).job);
+  assert.equal(job.status, "ready");
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+  const restarted = await createVideoServer({ videoDir, publicDir });
+  restarted.listen(0, "127.0.0.1");
+  await once(restarted, "listening");
+  t.after(async () => {
+    restarted.closeAllConnections();
+    await new Promise((resolve) => restarted.close(resolve));
+  });
+  const secondBase = `http://127.0.0.1:${restarted.address().port}`;
+  assert.equal((await deleteVideo(secondBase, video)).status, 200);
+  assert.deepEqual(await readdir(path.join(videoDir, ".transcoded")), []);
+  assert.deepEqual(await readdir(path.join(videoDir, "user")), []);
+  await assert.rejects(readFile(path.join(videoDir, ".processed.json")), { code: "ENOENT" });
 });
 
 async function startDownload(base, user, name, headers = {}) {

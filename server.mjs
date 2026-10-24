@@ -220,6 +220,8 @@ export async function createVideoServer(options = {}) {
   const inspectVideo = options.isCompatibleVideo ?? isCompatibleVideo;
   const downloadJobs = new Map();
   const downloadChecks = new Map();
+  const downloadReaders = new Map();
+  const deletingVideos = new Set();
   const cacheDir = path.join(videoDir, ".transcoded");
   const cacheLifetime = 7 * 24 * 60 * 60 * 1000;
   let conversionTail = Promise.resolve();
@@ -313,14 +315,31 @@ export async function createVideoServer(options = {}) {
     }
   }
 
+  function downloadId(user, name, info) {
+    return createHash("sha256").update(JSON.stringify([
+      "h264-aac-v1", user, name, info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs,
+    ])).digest("hex");
+  }
+
   async function createDownload(req) {
     const body = await readJson(req);
     const user = safeSegment(body?.user, "用户名");
     const name = safeSegment(body?.name);
+    const key = `${user}/${name}`;
+    if (deletingVideos.has(key)) throw new HttpError(409, "视频正在删除，请稍后刷新列表。");
+    downloadReaders.set(key, (downloadReaders.get(key) || 0) + 1);
+    try {
+      return await prepareDownload(user, name, key);
+    } finally {
+      const readers = downloadReaders.get(key) - 1;
+      if (readers) downloadReaders.set(key, readers);
+      else downloadReaders.delete(key);
+    }
+  }
+
+  async function prepareDownload(user, name, key) {
     const { handle, info } = await openVideo(user, name);
-    const id = createHash("sha256").update(JSON.stringify([
-      "h264-aac-v1", user, name, info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs,
-    ])).digest("hex");
+    const id = downloadId(user, name, info);
     let transferred = false;
     try {
       // Coalesce concurrent checks before probing or submitting a conversion.
@@ -333,7 +352,7 @@ export async function createVideoServer(options = {}) {
 
         const target = path.join(cacheDir, `${id}.mp4`);
         const job = {
-          id, status: "ready", progress: 1, name: `${path.parse(name).name}.mp4`,
+          id, sourceKey: key, status: "ready", progress: 1, name: `${path.parse(name).name}.mp4`,
           downloadUrl: `/api/downloads/${id}/file`,
         };
         let cached;
@@ -493,12 +512,7 @@ export async function createVideoServer(options = {}) {
     return { users, videos, today: localDate(), timeZone, maxUploadBytes };
   }
 
-  async function setProcessed(req) {
-    const body = await readJson(req);
-    const user = safeSegment(body?.user, "用户名");
-    const name = safeSegment(body?.name);
-    if (typeof body?.processed !== "boolean")
-      throw new HttpError(400, "处理状态必须是布尔值。");
+  async function videoInfo(user, name) {
     if (!VIDEO_TYPES.has(path.extname(name).toLowerCase()))
       throw new HttpError(404, "视频不存在。");
     const folder = await userFolder(user);
@@ -511,32 +525,96 @@ export async function createVideoServer(options = {}) {
     }
     if (!info.isFile() || info.isSymbolicLink())
       throw new HttpError(404, "视频不存在。");
+    return { folder, info };
+  }
 
-    // Serialize read/modify/write operations so concurrent clicks cannot lose
-    // another video's status. Publish memory only after the atomic file replace.
-    const write = processedWrite.then(async () => {
-      const next = { ...processedVideos, [`${user}/${name}`]: body.processed };
-      const tempPath = path.join(videoDir, `.processed-${randomUUID()}.tmp`);
-      let handle;
-      try {
-        handle = await open(tempPath, "wx", 0o600);
-        await handle.writeFile(JSON.stringify(next, null, 2) + "\n");
-        await handle.sync();
-        await handle.close();
-        handle = null;
-        await rename(tempPath, processedPath);
-        processedVideos = next;
-      } finally {
-        if (handle) await handle.close().catch(() => {});
-        await unlink(tempPath).catch((error) => {
-          if (error.code !== "ENOENT")
-            console.error("处理状态临时文件清理失败:", error.message);
-        });
-      }
-      return { video: videoMetadata(user, name, info) };
-    });
+  async function saveProcessed(next) {
+    const tempPath = path.join(videoDir, `.processed-${randomUUID()}.tmp`);
+    let handle;
+    try {
+      handle = await open(tempPath, "wx", 0o600);
+      await handle.writeFile(JSON.stringify(next, null, 2) + "\n");
+      await handle.sync();
+      await handle.close();
+      handle = null;
+      await rename(tempPath, processedPath);
+      processedVideos = next;
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await unlink(tempPath).catch((error) => {
+        if (error.code !== "ENOENT")
+          console.error("处理状态临时文件清理失败:", error.message);
+      });
+    }
+  }
+
+  // Include existence checks in this queue so a late status save cannot recreate
+  // the record for a deleted video, or overwrite another video's latest status.
+  function updateProcessed(run) {
+    const write = processedWrite.then(run);
     processedWrite = write.catch(() => {});
     return write;
+  }
+
+  async function setProcessed(req) {
+    const body = await readJson(req);
+    const user = safeSegment(body?.user, "用户名");
+    const name = safeSegment(body?.name);
+    if (typeof body?.processed !== "boolean")
+      throw new HttpError(400, "处理状态必须是布尔值。");
+    return updateProcessed(async () => {
+      const key = `${user}/${name}`;
+      if (deletingVideos.has(key)) throw new HttpError(409, "视频正在删除，请稍后刷新列表。");
+      const { info } = await videoInfo(user, name);
+      await saveProcessed({ ...processedVideos, [key]: body.processed });
+      return { video: videoMetadata(user, name, info) };
+    });
+  }
+
+  async function deleteVideo(req) {
+    const body = await readJson(req);
+    const user = safeSegment(body?.user, "用户名");
+    const name = safeSegment(body?.name);
+    const key = `${user}/${name}`;
+    if (deletingVideos.has(key)) throw new HttpError(409, "视频正在删除，请稍后刷新列表。");
+    if (downloadReaders.has(key) || [...downloadJobs.values()].some((job) =>
+      job.sourceKey === key && ["queued", "processing"].includes(job.status)))
+      throw new HttpError(409, "视频正在准备下载，请等待完成后再删除。");
+    deletingVideos.add(key);
+    try {
+      return await updateProcessed(async () => {
+        const { folder, info } = await videoInfo(user, name);
+        const ids = new Set([downloadId(user, name, info)]);
+        for (const job of downloadJobs.values()) {
+          if (job.sourceKey === key) ids.add(job.id);
+        }
+        if (await cacheExists()) {
+          for (const id of ids) {
+            await unlink(path.join(cacheDir, `${id}.mp4`)).catch((error) => {
+              if (error.code !== "ENOENT") throw error;
+            });
+          }
+        }
+        const previous = processedVideos;
+        const hasStatus = Object.hasOwn(previous, key);
+        if (hasStatus) {
+          const next = { ...previous };
+          delete next[key];
+          // Persist first: a failed status write must not delete the source.
+          await saveProcessed(next);
+        }
+        try {
+          await unlink(path.join(folder, name));
+        } catch (error) {
+          if (hasStatus) await saveProcessed(previous);
+          throw error;
+        }
+        for (const id of ids) downloadJobs.delete(id);
+        return { deleted: { user, name } };
+      });
+    } finally {
+      deletingVideos.delete(key);
+    }
   }
 
   async function upload(req, url, res) {
@@ -772,16 +850,16 @@ export async function createVideoServer(options = {}) {
         throw new HttpError(403, "此 Host 不允许访问。");
       }
       const url = new URL(req.url, authority.origin);
-      if (!["GET", "HEAD", "POST"].includes(req.method))
+      if (!["GET", "HEAD", "POST", "DELETE"].includes(req.method))
         throw new HttpError(405, "请求方法不支持。");
-      if (req.method === "POST") {
+      if (["POST", "DELETE"].includes(req.method)) {
         const origin = req.headers.origin;
         const fetchSite = req.headers["sec-fetch-site"];
         if (
           (origin && origin !== authority.origin) ||
           (fetchSite && !["same-origin", "none"].includes(fetchSite))
         ) {
-          throw new HttpError(403, "不允许跨站写入。请从本网站上传。");
+          throw new HttpError(403, "不允许跨站写入。请从本网站操作。");
         }
       }
       if (url.pathname === "/api/library" && req.method === "GET") {
@@ -823,6 +901,10 @@ export async function createVideoServer(options = {}) {
         json(res, 200, await setProcessed(req));
         return;
       }
+      if (url.pathname === "/api/videos" && req.method === "DELETE") {
+        json(res, 200, await deleteVideo(req));
+        return;
+      }
       if (
         url.pathname.startsWith("/media/") &&
         ["GET", "HEAD"].includes(req.method)
@@ -852,7 +934,7 @@ export async function createVideoServer(options = {}) {
         ["GET", "HEAD"].includes(req.method) &&
         !url.pathname.startsWith("/api/")
       ) {
-        let asset = ["/", "/upload", "/upload/"].includes(url.pathname)
+        let asset = ["/", "/upload", "/upload/", "/manage", "/manage/"].includes(url.pathname)
           ? "index.html"
           : url.pathname.slice(1);
         try {

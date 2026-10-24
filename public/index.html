@@ -19,9 +19,14 @@
         <a href="#library" class="brand" aria-label="回到视频库" title="视频库">
           <span class="brand-icon" aria-hidden="true">▶</span>
         </a>
-        <button class="button primary" id="quickUpload">
-          <span data-icon="plus"></span>上传视频
-        </button>
+        <div class="header-actions">
+          <button class="button primary" id="quickUpload">
+            <span data-icon="plus"></span>上传视频
+          </button>
+          <a href="#manage" id="manageLink" class="icon-button" title="管理视频" aria-label="管理视频">
+            <span data-icon="manage"></span>
+          </a>
+        </div>
       </nav>
     </header>
     <main class="shell">
@@ -113,6 +118,47 @@
           </div>
         </section>
       </section>
+      <section id="manageView" class="manage-view" hidden aria-labelledby="manageTitle">
+        <a class="back-link" href="#library"><span data-icon="arrowLeft"></span>返回视频库</a>
+        <div class="section-heading">
+          <div class="title-line">
+            <h1 id="manageTitle">管理视频</h1>
+            <span id="manageCount" class="count-pill">0</span>
+          </div>
+        </div>
+        <p class="manage-description">查看视频信息，删除不再需要的视频。</p>
+        <div class="toolbar management-toolbar">
+          <label class="search-box"><span data-icon="search"></span><input id="manageSearch" type="search" placeholder="搜索视频名称…" aria-label="搜索管理列表" /></label>
+          <div class="toolbar-actions">
+            <label class="sort-control"><span data-icon="folder"></span><select id="manageUser" aria-label="按分组筛选"><option value="">全部分组</option></select></label>
+            <label class="sort-control"><select id="manageProcessed" aria-label="按处理状态筛选">
+              <option value="all">全部处理状态</option>
+              <option value="unprocessed">未处理</option>
+              <option value="processed">已处理</option>
+            </select></label>
+            <label class="sort-control"><span data-icon="sort"></span><select id="manageSort" aria-label="管理列表时间排序">
+              <option value="desc">时间 · 从新到旧</option>
+              <option value="asc">时间 · 从旧到新</option>
+            </select></label>
+            <button id="manageRefresh" class="icon-button" title="刷新管理列表" aria-label="刷新管理列表"><span data-icon="refresh"></span></button>
+          </div>
+        </div>
+        <div class="results-line"><span id="manageSummary" role="status" aria-live="polite">正在读取视频…</span></div>
+        <div id="manageTableWrap" class="management-table-wrap" role="region" aria-label="视频管理列表，可横向滚动" tabindex="0" hidden>
+          <table class="management-table" aria-label="视频管理">
+            <thead><tr>
+              <th scope="col">名字</th><th scope="col">分组</th><th scope="col">时间</th><th scope="col">大小</th><th scope="col">是否已处理</th><th scope="col">操作</th>
+            </tr></thead>
+            <tbody id="manageRows"></tbody>
+          </table>
+        </div>
+        <div id="manageEmpty" class="empty-state" hidden></div>
+        <div id="managePaginationBar" class="pagination-bar" hidden>
+          <label class="page-size">每页 <select id="managePageSize" aria-label="管理列表每页视频数"><option value="48">48</option><option value="96">96</option><option value="192">192</option></select> 条</label>
+          <nav id="managePagination" class="pagination" aria-label="管理列表分页"></nav>
+          <span id="managePageSummary" class="page-summary"></span>
+        </div>
+      </section>
       <section
         id="uploadView"
         class="upload-view"
@@ -151,6 +197,22 @@
         </div>
       </section>
     </main>
+    <dialog id="deleteDialog" class="delete-dialog" aria-labelledby="deleteTitle" aria-describedby="deleteWarning deleteName deleteMeta">
+      <div class="dialog-heading">
+        <h2 id="deleteTitle">删除这个视频？</h2>
+        <button id="closeDelete" class="icon-button" type="button" aria-label="关闭删除确认"><span data-icon="close"></span></button>
+      </div>
+      <div class="dialog-body">
+        <p id="deleteWarning" class="delete-warning">视频将从服务器永久删除，无法撤销。</p>
+        <strong id="deleteName" class="delete-name"></strong>
+        <p id="deleteMeta" class="delete-meta"></p>
+        <p id="deleteError" class="error-message" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer delete-dialog-actions">
+        <button id="cancelDelete" class="button secondary" type="button" autofocus>取消</button>
+        <button id="confirmDelete" class="button danger" type="button"><span data-icon="trash"></span><span id="deleteButtonLabel">确认删除</span></button>
+      </div>
+    </dialog>
     <dialog
       id="playerDialog"
       class="player-dialog"
