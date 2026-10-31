@@ -47,7 +47,7 @@ const pageSizes = Array.from({ length: 10 }, (_, i) => (i + 1) * 48);
 const state = {
   videos: [],
   users: [],
-  selected: new Set(params.getAll("user")),
+  selected: params.get("user") || "",
   search: params.get("q") || "",
   hideProcessed: params.get("hideProcessed") === "1",
   sort: params.get("sort") === "asc" ? "asc" : "desc",
@@ -133,7 +133,7 @@ async function api(url, options) {
 }
 function syncURL() {
   const p = new URLSearchParams();
-  [...state.selected].forEach((name) => p.append("user", name));
+  if (state.selected) p.set("user", state.selected);
   if (state.search) p.set("q", state.search);
   if (state.hideProcessed) p.set("hideProcessed", "1");
   if (state.sort !== "desc") p.set("sort", state.sort);
@@ -160,19 +160,17 @@ function renderGridLayout() {
 }
 function renderFilters() {
   const all = button("全部用户", "filter-chip", () => {
-    state.selected.clear();
+    state.selected = "";
     state.page = 1;
     renderLibrary();
   });
-  all.setAttribute("aria-pressed", String(!state.selected.size));
+  all.setAttribute("aria-pressed", String(!state.selected));
   all.append(el("span", "filter-count", String(state.videos.length)));
   const fragment = document.createDocumentFragment();
   fragment.append(all);
   for (const user of state.users) {
     const b = button("", "filter-chip", () => {
-      state.selected.has(user.name)
-        ? state.selected.delete(user.name)
-        : state.selected.add(user.name);
+      state.selected = user.name;
       state.page = 1;
       renderLibrary();
     });
@@ -181,7 +179,7 @@ function renderFilters() {
       document.createTextNode(user.name),
       el("span", "filter-count", String(user.count)),
     );
-    b.setAttribute("aria-pressed", String(state.selected.has(user.name)));
+    b.setAttribute("aria-pressed", String(state.selected === user.name));
     fragment.append(b);
   }
   $("userFilters").replaceChildren(fragment);
@@ -190,7 +188,7 @@ function filteredVideos() {
   return state.videos
     .filter(
       (v) =>
-        (!state.selected.size || state.selected.has(v.user)) &&
+        (!state.selected || state.selected === v.user) &&
         (!state.hideProcessed || !v.processed) &&
         v.name.toLocaleLowerCase().includes(state.search.toLocaleLowerCase()),
     )
@@ -377,7 +375,7 @@ function renderEmpty(mode, message) {
       ? () => loadLibrary()
       : mode === "filtered"
         ? () => {
-            state.selected.clear();
+            state.selected = "";
             state.search = "";
             state.hideProcessed = false;
             $("searchInput").value = "";
@@ -454,7 +452,7 @@ function renderLibrary() {
   const start = (state.page - 1) * state.pageSize;
   $("totalCount").textContent = String(state.videos.length);
   $("collectionTitle").textContent =
-    state.selected.size || state.hideProcessed ? "筛选片刻" : "全部片刻";
+    state.selected || state.hideProcessed ? "筛选片刻" : "全部片刻";
   $("resultSummary").textContent = videos.length
     ? `共 ${videos.length} 个视频 · 正在展示 ${start + 1}–${Math.min(start + state.pageSize, videos.length)} 个`
     : "共 0 个视频";
@@ -466,7 +464,7 @@ function renderLibrary() {
   if (!videos.length)
     renderEmpty(
       state.videos.length ||
-        state.selected.size ||
+        state.selected ||
         state.search ||
         state.hideProcessed
         ? "filtered"
@@ -715,10 +713,10 @@ function updateUserOptions() {
   }
   if (state.users.some((u) => u.name === old)) $("uploadUser").value = old;
   else if (
-    state.selected.size === 1 &&
-    state.users.some((u) => state.selected.has(u.name))
+    state.selected &&
+    state.users.some((u) => u.name === state.selected)
   )
-    $("uploadUser").value = [...state.selected][0];
+    $("uploadUser").value = state.selected;
   updateUploadButton();
 }
 async function loadLibrary({ notify = false } = {}) {
@@ -744,11 +742,7 @@ async function loadLibrary({ notify = false } = {}) {
     state.maxUploadBytes = data.maxUploadBytes;
     state.loaded = true;
     state.loadError = "";
-    state.selected = new Set(
-      [...state.selected].filter((name) =>
-        state.users.some((u) => u.name === name),
-      ),
-    );
+    if (!state.users.some((u) => u.name === state.selected)) state.selected = "";
     renderCurrentView();
     const playerToggle =
       $("playerProcessedControl").querySelector(".processed-toggle");
