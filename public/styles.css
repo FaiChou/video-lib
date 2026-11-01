@@ -524,7 +524,7 @@ input::placeholder {
 .thumbnail {
   position: relative;
   display: block;
-  aspect-ratio: 16/10;
+  aspect-ratio: 1/1;
   width: 100%;
   padding: 0;
   background: #eceff2;
@@ -1734,7 +1734,6 @@ dialog::backdrop {
   }
   .thumbnail {
     border-radius: 8px 8px 0 0;
-    aspect-ratio: 4/3;
   }
   .video-info {
     padding: 10px 8px 8px;
