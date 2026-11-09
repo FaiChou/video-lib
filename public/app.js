@@ -1108,8 +1108,6 @@ function renderQueue() {
   $("uploadQueue").replaceChildren();
   for (const item of queue) {
     const row = el("div", "queue-item");
-    const fileIcon = el("span", "queue-file-icon");
-    fileIcon.append(icon("film"));
     const info = el("div", "queue-file-info");
     const name = el("p", "queue-file-name", item.file.name);
     name.title = item.file.name;
@@ -1117,7 +1115,7 @@ function renderQueue() {
       "p",
       `queue-file-status ${item.status === "success" ? "success" : item.status === "failed" ? "failed" : ""}`,
       item.status === "success"
-        ? `已保存为 ${item.savedName}`
+        ? `已保存到 ${item.savedUser} 的收藏 · ${item.savedName}`
         : item.status === "failed"
           ? item.error
           : item.status === "uploading"
@@ -1156,7 +1154,7 @@ function renderQueue() {
     );
     remove.disabled = uploading;
     remove.setAttribute("aria-label", `移除 ${item.file.name}`);
-    row.append(fileIcon, info, date, remove);
+    row.append(info, date, remove);
     $("uploadQueue").append(row);
   }
   updateUploadButton();
@@ -1291,8 +1289,9 @@ async function submitUploads(e) {
       );
       item.status = "success";
       item.savedName = data.video.name;
+      item.savedUser = data.video.user;
       success++;
-      item.statusEl.textContent = `已保存为 ${item.savedName}`;
+      item.statusEl.textContent = `已保存到 ${item.savedUser} 的收藏 · ${item.savedName}`;
       item.statusEl.classList.add("success");
     } catch (error) {
       item.status = "failed";

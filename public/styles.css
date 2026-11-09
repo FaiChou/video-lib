@@ -1370,25 +1370,12 @@ dialog::backdrop {
 }
 .queue-item {
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) 125px 26px;
+  grid-template-columns: minmax(0, 1fr) 125px 26px;
   gap: 9px;
   align-items: center;
   border: 1px solid #eee9f0;
   border-radius: 8px;
   padding: 10px;
-}
-.queue-file-icon {
-  width: 32px;
-  height: 38px;
-  background: #f1eef7;
-  color: #b2a1c5;
-  border-radius: 5px;
-  display: grid;
-  place-items: center;
-}
-.queue-file-icon svg {
-  width: 18px;
-  height: 18px;
 }
 .queue-file-info {
   min-width: 0;
@@ -1828,9 +1815,6 @@ dialog::backdrop {
     grid-template-columns: minmax(0, 1fr) 114px 22px;
     gap: 6px;
     padding: 9px 7px;
-  }
-  .queue-file-icon {
-    display: none;
   }
   .queue-date input {
     width: 114px;
