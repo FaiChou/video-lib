@@ -2,7 +2,7 @@
 
 使用 Node.js 22+ 和 npm，安装依赖后即可运行，不需要执行 build。以下操作在 Debian 服务器上以 root 执行，服务也使用 root 运行，无需创建额外的系统用户或组。
 
-默认项目位置为 `/opt/video-library`，视频存放在 `/opt/video-library/videos/用户名/`，监听地址为 `0.0.0.0:8876`（所有 IPv4 网卡）。服务使用程序默认值，无需环境配置文件。
+默认项目位置为 `/opt/video-library`，视频存放在 `/opt/video-library/videos/用户名/`，监听地址为 `0.0.0.0:8876`（所有 IPv4 网卡）。本地视频库可使用默认值；R2 同步通过 `/opt/video-library/.env` 配置，默认关闭。
 
 同一局域网中的设备可直接访问 **http://nuc8.local:8876**，也可使用服务器的局域网 IPv4 地址。当前版本没有登录鉴权：能访问页面的人都能浏览、下载和上传。
 
@@ -32,7 +32,7 @@ command -v node
 
 ```sh
 install -d -o root -g root -m 0755 /opt/video-library
-install -m 0644 server.mjs media-converter.mjs package.json package-lock.json README.md DEPLOY_DEBIAN.md /opt/video-library/
+install -m 0644 server.mjs media-converter.mjs env.mjs r2-runtime.mjs r2-sync.mjs sync-r2.mjs package.json package-lock.json .env.example README.md DEPLOY_DEBIAN.md /opt/video-library/
 cp -R public deploy tests /opt/video-library/
 install -d -o root -g root -m 0750 /opt/video-library/videos
 cp -R videos/. /opt/video-library/videos/
@@ -47,7 +47,7 @@ cd /opt/video-library
 npm ci
 ```
 
-请保留 `package-lock.json`。`npm ci` 会安装锁定版本的 `mediabunny` 和 `@mediabunny/server`；后者依赖 NodeAV 的原生编解码器，安装时按服务器平台下载预编译依赖及附带工具，需要联网。无需手动安装或调用 FFmpeg 命令。不要从 macOS、Windows 或其他架构复制 `node_modules/`，也不要省略平台相关的可选依赖或跳过安装脚本。
+请保留 `package-lock.json`。`npm ci` 会安装锁定版本的媒体库及 R2 SDK 等依赖；`@mediabunny/server` 依赖 NodeAV 的原生编解码器，安装时按服务器平台下载预编译依赖及附带工具，需要联网。无需手动安装或调用 FFmpeg 命令。不要从 macOS、Windows 或其他架构复制 `node_modules/`，也不要省略平台相关的可选依赖或跳过安装脚本。
 
 转换任务由服务器执行，使用 CPU 软件编解码，关闭 GPU 自动探测，无需 CUDA 或 VAAPI 驱动。客户端仍可通过局域网 HTTP 使用，无需 HTTPS 或浏览器 WebCodecs。首次部署后可以运行 `npm test`，验证真实视频编码转换及接口行为。
 
@@ -64,12 +64,45 @@ chmod -R u=rwX,g=rX,o= videos
 
 视频目录由 root 读写。服务保留文件系统保护配置，项目内仅允许写入 `videos/`。
 
+### 可选：配置 R2 同步
+
+首次配置时执行；已有 `.env` 会被保留：
+
+```sh
+cd /opt/video-library
+cp -n .env.example .env
+chmod 600 .env
+nano .env
+```
+
+填入 `R2_ACCESS_KEY_ID` 和 `R2_SECRET_ACCESS_KEY`（R2 的 S3 密钥，不能使用 `cfat_` token），将 `R2_SYNC_ENABLED` 改为 `true`。同步端只需私有桶的对象读取权限。样例中的 Endpoint、桶名已按交接填写。
+
+`R2_SYNC_TIMES=07:30,12:00` 表示每天北京时间 07:30 和 12:00 同步，时区由 `R2_SYNC_TIMEZONE=Asia/Shanghai` 指定；`R2_SYNC_ON_START=true` 还会在启动时补同步。需要代理时设置 `R2_PROXY_URL=http://127.0.0.1:7890`，留空就直连，不读取 shell 中的全局代理变量。
+
+先手动验证一次，再启动服务：
+
+```sh
+npm run sync:r2
+```
+
+这会实际下载素材。成功后视频位于 `videos/selena/`、`videos/granada/` 或 `videos/lili/` 等索引对应的账号目录，封面缓存在 `videos/.r2-covers/`，最近结果写入 `videos/.r2-sync-status.json`。手动命令不受 `R2_SYNC_ENABLED` 开关影响，失败时返回非零退出码；与服务中的定时同步重叠时会跳过本次。
+
+同步保留原视频编码，不进行转码；浏览器播放 VP9 的支持情况与网页上传后生成的 H.264 不同，下载时仍能使用现有转换流程。同名、同大小文件跳过，大小不同的文件校验成功后才原子替换。失败文件下次重试，本地历史素材不会被删除；仍在 R2 索引中的素材若从本地删除，下次会重新下载。完整配置与行为见 [README 的 R2 同步说明](README.md#r2-素材同步)。
+
+程序自动读取项目根 `.env`，无需修改 service 添加 `EnvironmentFile`；已有系统环境变量优先。修改 `.env` 后执行 `systemctl restart video-library`。该文件已被 Git 忽略，备份配置时单独保管密钥。
+
 最终结构：
 
 ```text
 /opt/video-library/
 ├── server.mjs
 ├── media-converter.mjs
+├── env.mjs
+├── r2-runtime.mjs
+├── r2-sync.mjs
+├── sync-r2.mjs
+├── .env.example
+├── .env                 # 可选，密钥文件，权限 0600
 ├── package.json
 ├── package-lock.json
 ├── node_modules/
@@ -193,11 +226,11 @@ systemctl restart video-library
 systemctl stop video-library
 ```
 
-如果通过 Git 直接在 `/opt/video-library` 更新代码，跳过下面的复制命令。如果使用新版本解压目录，复制代码时保留视频：
+如果通过 Git 直接在 `/opt/video-library` 更新代码，跳过下面的复制命令。如果使用新版本解压目录，按以下列表复制代码，保留已有视频与 `.env`；使用其他同步工具时也应排除本地 `.env` 等私有配置，只更新 `.env.example`：
 
 ```sh
 cd ~/video-library
-install -m 0644 server.mjs media-converter.mjs package.json package-lock.json README.md DEPLOY_DEBIAN.md /opt/video-library/
+install -m 0644 server.mjs media-converter.mjs env.mjs r2-runtime.mjs r2-sync.mjs sync-r2.mjs package.json package-lock.json .env.example README.md DEPLOY_DEBIAN.md /opt/video-library/
 cp -R public deploy tests /opt/video-library/
 ```
 
@@ -230,7 +263,7 @@ systemctl daemon-reload
 systemctl start video-library
 ```
 
-旧版本升级后也会使用程序默认值，按第四步直接访问 **http://nuc8.local:8876** 或服务器的局域网 IPv4 地址。修改 `.service` 后，需要先 `systemctl daemon-reload` 再重启。
+没有 `.env` 时，旧版本升级后继续使用程序默认值；有 `.env` 时会加载其中的配置。按第四步访问 **http://nuc8.local:8876** 或服务器的局域网 IPv4 地址。修改 `.service` 后，需要先 `systemctl daemon-reload` 再重启；只修改 `.env` 时重启即可。
 
 以后手动复制素材后，应确认 root 可以读写，例如：
 
@@ -239,7 +272,7 @@ chown -R root:root /opt/video-library/videos
 chmod -R u=rwX,g=rX,o= /opt/video-library/videos
 ```
 
-在网页里点击刷新即可，无需重启。备份时保留 `/opt/video-library/videos` 和 `/etc/systemd/system/video-library.service`。素材目录中的 `.processed.json` 保存处理状态，应随原件一起备份。
+在网页里点击刷新即可，无需重启。备份时保留 `/opt/video-library/videos`、私下保管的 `/opt/video-library/.env`（如有）和 `/etc/systemd/system/video-library.service`。素材目录中的 `.processed.json` 保存处理状态，应随原件一起备份。
 
 旧素材下载时需要的 H.264 MP4 缓存在 `/opt/video-library/videos/.transcoded/`，不会覆盖原件，重复下载及重启服务后可复用缓存。7 天未使用的缓存会在准备新的下载任务时清理。缓存可重新生成，备份时可排除；如需释放空间，可先停止服务再删除缓存目录。上传转换及缓存生成都需要额外磁盘空间。
 
@@ -251,6 +284,8 @@ chmod -R u=rwX,g=rX,o= /opt/video-library/videos
 | `217/USER`                    | 安装新版服务文件，确认 `User=root`、`Group=root`，再执行 `daemon-reload`、`reset-failed` 和 `restart`。                                                                           |
 | `ERR_MODULE_NOT_FOUND` / 缺少原生模块 | 确认在服务器运行过 `npm ci`，保留锁文件、平台可选依赖与安装脚本；不要复制其他平台的 `node_modules/`。 |
 | 安装依赖下载失败             | 检查服务器访问 npm 和依赖下载地址的网络，修复后重新运行 `npm ci`。 |
+| R2 同步失败或没有新素材      | 查看 `journalctl -u video-library -n 100 --no-pager` 和 `videos/.r2-sync-status.json`；检查 S3 密钥、桶名和代理，执行 `npm run sync:r2` 验证。密钥不要粘贴到日志或网页。 |
+| 手动同步提示已有任务         | 等当前同步完成；进程异常退出后，锁约 60 秒过期，再重试。 |
 | 转换失败或等待时间较长       | 查看网页错误与 `journalctl` 日志，检查磁盘空间；转换任务串行执行，已有任务未完成时后续任务会等待。旧素材可以下载原文件。 |
 | 下载提示「接口不存在」       | 新页面可能仍连接旧 Node 进程；确认更新了服务端代码、执行 `npm ci` 并重启 `video-library`，再刷新页面。 |
 | 转码时出现 `status=11/SEGV`   | 若崩溃前有 CUDA/VAAPI 探测错误，更新 `media-converter.mjs` 并重启；新版明确关闭编解码器硬件探测，使用软件转换。 |

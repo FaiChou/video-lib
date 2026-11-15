@@ -20,6 +20,7 @@ import { isIP } from "node:net";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { isCompatibleVideo, normalizeVideo } from "./media-converter.mjs";
+import { loadProjectEnv } from "./env.mjs";
 
 const PROJECT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HOST = "0.0.0.0";
@@ -982,29 +983,52 @@ if (
   process.argv[1] &&
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
-  const host = process.env.HOST || DEFAULT_HOST;
-  const port = Number(process.env.PORT || 8876);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    console.error("PORT 必须是 1 到 65535 之间的整数。");
-    process.exitCode = 1;
-  } else {
-    try {
-      const server = await createVideoServer({ host });
-      server.on("error", (error) => {
-        console.error(`启动失败：${error.message}`);
-        process.exitCode = 1;
-      });
-      server.listen(port, host, () => {
-        const displayHost = host.includes(":") ? `[${host}]` : host;
-        console.log(`视频库已启动：http://${displayHost}:${port}`);
-        console.log(
-          `视频目录：${path.resolve(process.env.VIDEO_DIR || path.join(PROJECT_DIR, "videos"))}`,
-        );
-        console.log("按 Ctrl+C 停止。");
-      });
-    } catch (error) {
+  try {
+    loadProjectEnv();
+    const { readR2Config, startR2Sync } = await import("./r2-runtime.mjs");
+    const config = readR2Config();
+    const host = process.env.HOST || DEFAULT_HOST;
+    const port = Number(process.env.PORT || 8876);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("PORT 必须是 1 到 65535 之间的整数。");
+    }
+    const videoDir = path.resolve(process.env.VIDEO_DIR || path.join(PROJECT_DIR, "videos"));
+    const server = await createVideoServer({ host, videoDir });
+    let sync;
+    let stopping = false;
+    const stop = async () => {
+      if (stopping) return;
+      stopping = true;
+      const deadline = setTimeout(() => server.closeAllConnections(), 25_000);
+      deadline.unref();
+      await Promise.all([
+        sync?.stop(),
+        new Promise((resolve) => server.close(resolve)),
+      ]);
+      clearTimeout(deadline);
+    };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    server.on("error", (error) => {
       console.error(`启动失败：${error.message}`);
       process.exitCode = 1;
-    }
+      void stop();
+    });
+    server.listen(port, host, () => {
+      const displayHost = host.includes(":") ? `[${host}]` : host;
+      console.log(`视频库已启动：http://${displayHost}:${port}`);
+      console.log(`视频目录：${videoDir}`);
+      console.log("按 Ctrl+C 停止。");
+      try {
+        sync = startR2Sync({ videoDir, config });
+      } catch {
+        console.error("R2 定时同步启动失败，请检查配置和依赖。");
+        process.exitCode = 1;
+        void stop();
+      }
+    });
+  } catch (error) {
+    console.error(`启动失败：${error.message}`);
+    process.exitCode = 1;
   }
 }

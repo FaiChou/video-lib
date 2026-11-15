@@ -6,13 +6,19 @@
   "description": "无需构建、支持自动转换 H.264 MP4 的本地视频库",
   "scripts": {
     "start": "node server.mjs",
+    "sync:r2": "node sync-r2.mjs",
     "test": "node --test tests/*.test.mjs"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1169.0",
     "@mediabunny/server": "1.62.1",
-    "mediabunny": "1.62.1"
+    "@smithy/node-http-handler": "4.14.2",
+    "https-proxy-agent": "9.1.0",
+    "mediabunny": "1.62.1",
+    "node-cron": "4.6.0",
+    "proper-lockfile": "4.1.2"
   }
 }

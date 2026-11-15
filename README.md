@@ -4,7 +4,7 @@
 
 ## Debian 部署
 
-使用 Node.js 22+，以 root 按 [Debian 部署教程](DEPLOY_DEBIAN.md) 安装 `deploy/video-library.service`，即可后台运行、开机自启及异常重启。服务使用 root 运行，直接使用程序默认值，无需创建额外的系统用户或环境配置文件。
+使用 Node.js 22+，以 root 按 [Debian 部署教程](DEPLOY_DEBIAN.md) 安装 `deploy/video-library.service`，即可后台运行、开机自启及异常重启。服务使用 root 运行，本地视频库可直接使用默认值；启用 R2 同步时在项目根目录的 `.env` 配置密钥和时间。
 
 ## 手动启动
 
@@ -114,7 +114,7 @@ video-library/
 
 ## 默认配置
 
-安装依赖后即可启动，无需创建或加载环境配置文件。
+安装依赖后即可启动。程序会自动读取项目根目录的 `.env`（如果存在），已有系统环境变量优先；没有 `.env` 时使用默认值，R2 同步默认关闭。
 
 | 项目 | 默认值 |
 | ---- | ------ |
@@ -128,6 +128,47 @@ video-library/
 | 缓存保留时间 | 7 天未使用后，在准备新的下载任务时清理 |
 
 部署在局域网中的 Debian 服务器后，可直接访问 **http://nuc8.local:8876**，无需额外配置。若服务器启用了防火墙，需允许局域网访问 TCP 8876 端口。当前版本没有登录鉴权，能访问的人都能浏览、下载、上传和删除。
+
+## R2 素材同步
+
+使用 AWS SDK v3 从私有 R2 桶读取 `manifest.json`，按索引下载新增素材。浏览器始终访问本地文件，无需访问 R2 或配置代理。同步端只读取 R2，不修改索引、桶权限或远端对象，也不删除本地历史素材。
+
+首次配置（已有 `.env` 时直接编辑，保留原配置）：
+
+```sh
+cp -n .env.example .env
+chmod 600 .env
+```
+
+编辑 `.env`，填入 `R2_ACCESS_KEY_ID` 和 `R2_SECRET_ACCESS_KEY`，再把 `R2_SYNC_ENABLED` 改为 `true`。这里需要 R2 的 **S3 Access Key ID / Secret Access Key**，不能使用 `cfat_` 开头的 Cloudflare API token；同步端只需该桶的对象读取权限。样例已填入交接中的 Endpoint 和 `video-materials` 桶名，真实密钥不会被提交到 Git 或发送到网页。
+
+| 变量 | 说明 / 默认值 |
+| ---- | ---- |
+| `R2_SYNC_ENABLED` | 是否随服务启用同步，默认 `false` |
+| `R2_ENDPOINT`、`R2_BUCKET` | S3 API 地址和私有桶名 |
+| `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY` | S3 密钥，启用时必填 |
+| `R2_REGION` | `auto` |
+| `R2_MANIFEST_KEY` | `manifest.json` |
+| `R2_SYNC_TIMES` | 每天的时间，默认 `07:30,12:00`，可用逗号配置多个 `HH:mm` |
+| `R2_SYNC_TIMEZONE` | `Asia/Shanghai`，同步时间使用此时区 |
+| `R2_SYNC_ON_START` | 默认 `true`，服务启动后立即补同步一次 |
+| `R2_PROXY_URL` | 留空直连；可填 `http://127.0.0.1:7890`，支持 HTTP / HTTPS 代理 |
+
+只使用 `R2_PROXY_URL` 决定代理，不继承全局 `HTTP_PROXY` / `HTTPS_PROXY`。修改 `.env` 后重启服务生效；Node 自己加载配置，systemd 无需另加 `EnvironmentFile`。
+
+填写密钥后，可先手动执行一次验证配置（此命令即使 `R2_SYNC_ENABLED=false` 也会同步）：
+
+```sh
+npm run sync:r2
+```
+
+视频原样保存到 `videos/<account>/<file>`，保留 Instagram 的发布日期文件名与编码，不走网页上传的转码流程。VP9 原件能否在页面播放取决于浏览器支持；点击「下载」时仍沿用已有的 H.264 MP4 转换流程。封面保存到 `videos/.r2-covers/<account>/<文件名主体>.jpg`，当前页面仍使用视频预览，不读取这些封面。
+
+每次同步先检查整个索引：同名且大小一致的视频跳过，缺失或大小不同的文件下载到临时文件，校验字节数后才发布或替换。下载失败保留已有文件，下次同步重试。同步范围以当前全量索引为准；交接中的 2026-11-15 之前 39 条历史合集不在 R2 上，不会自动补齐，也不会影响本地已有素材。**从本地管理页删除、但仍存在于 R2 索引中的视频，下次同步会重新下载。**
+
+完成后刷新视频库即可看到新素材。同步结果会写入日志和 `videos/.r2-sync-status.json`，包含最近同步时间、新增、修复、跳过及失败数量。手动命令遇到同步失败返回非零退出码。定时和手动同步互斥；已有同步执行时跳过本次，异常退出后的锁约 60 秒后过期。
+
+SDK 配置参考 [Cloudflare R2 官方示例](https://developers.cloudflare.com/r2/examples/aws/aws-sdk-js-v3/)，代理通过 [AWS SDK 的 HTTP handler](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/node-configuring-proxies.html) 显式配置。
 
 ## 格式兼容
 
@@ -143,6 +184,10 @@ video-library/
 
 - `server.mjs`：目录扫描、文件流、Range 播放、上传下载及删除接口、转换排队和下载缓存。
 - `media-converter.mjs`：实际编码检测及 H.264/AAC MP4 转换。
+- `r2-sync.mjs`：索引校验、原始素材和封面的增量下载、同步状态及互斥锁。
+- `r2-runtime.mjs`、`env.mjs`：R2 SDK、代理、定时调度和 `.env` 加载。
+- `sync-r2.mjs`：手动执行一次 R2 同步。
+- `.env.example`：R2 配置样例，不含真实密钥。
 - `public/index.html`：视频库、管理页、上传页及弹窗结构。
 - `public/styles.css`：页面和移动端样式。
 - `public/app.js`：筛选、排序、分页、播放、上传和管理删除交互。
