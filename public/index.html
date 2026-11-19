@@ -110,15 +110,21 @@
           </div>
         </section>
       </section>
-      <nav id="manageNav" class="manage-nav" aria-label="管理页面导航" hidden>
-        <a href="#manage" id="manageTabVideos" class="manage-tab">
-          <span data-icon="film"></span>视频管理
-        </a>
-        <a href="#manage/export" id="manageTabExport" class="manage-tab">
-          <span data-icon="sliders"></span>水印与音乐
-          <span id="exportActiveBadge" class="manage-tab-badge" hidden></span>
-        </a>
-      </nav>
+      <div id="manageTopbar" class="manage-topbar" hidden>
+        <nav id="manageNav" class="manage-nav" aria-label="管理页面导航">
+          <a href="#manage" id="manageTabVideos" class="manage-tab">
+            <span data-icon="film"></span>视频管理
+          </a>
+          <a href="#manage/export" id="manageTabExport" class="manage-tab">
+            <span data-icon="sliders"></span>水印与音乐
+            <span id="exportActiveBadge" class="manage-tab-badge" hidden></span>
+          </a>
+        </nav>
+        <div id="exportActions" class="export-actions" hidden>
+          <button id="exportReset" class="button secondary" type="button">重置默认</button>
+          <button id="exportSave" class="button primary" type="button" disabled>保存设置</button>
+        </div>
+      </div>
       <section id="manageView" class="manage-view" hidden aria-label="管理视频">
         <div class="toolbar management-toolbar">
           <label class="search-box"><span data-icon="search"></span><input id="manageSearch" type="search" placeholder="搜索视频名称…" aria-label="搜索管理列表" /></label>
@@ -161,16 +167,6 @@
         </div>
       </section>
       <section id="exportView" class="export-view" hidden aria-label="水印与音乐设置">
-        <div class="export-header">
-          <div class="export-heading">
-            <h1>下载导出处理：水印与音乐</h1>
-          </div>
-          <div class="export-actions">
-            <span id="exportDirtyState" class="export-dirty-state" role="status" aria-live="polite">已保存</span>
-            <button id="exportReset" class="button secondary" type="button">重置默认</button>
-            <button id="exportSave" class="button primary" type="button">保存设置</button>
-          </div>
-        </div>
         <p id="exportError" class="error-message" role="alert" hidden></p>
         <div class="export-layout">
           <div class="export-preview-col">
@@ -448,6 +444,7 @@
     <dialog
       id="playerDialog"
       class="player-dialog"
+      closedby="any"
       aria-labelledby="playerTitle"
     >
       <div class="player-heading">
@@ -459,7 +456,37 @@
           <span data-icon="close"></span>
         </button>
       </div>
-      <video id="player" controls playsinline preload="metadata"></video>
+      <div id="playerStage" class="player-stage">
+        <video id="player" playsinline preload="metadata"></video>
+        <canvas
+          id="playerWatermarkCanvas"
+          class="player-watermark-canvas"
+          aria-hidden="true"
+        ></canvas>
+      </div>
+      <div id="playerControls" class="player-controls">
+        <button
+          type="button"
+          id="playerPlayToggle"
+          class="icon-button preview-play-btn"
+          aria-label="播放视频"
+          title="播放"
+        >
+          <span data-icon="play"></span>
+        </button>
+        <input
+          id="playerSeek"
+          class="export-range preview-seek"
+          type="range"
+          min="0"
+          max="1000"
+          step="1"
+          value="0"
+          aria-label="播放进度"
+        />
+        <span id="playerTime" class="preview-time">0:00 / 0:00</span>
+      </div>
+      <audio id="playerAudio" preload="auto"></audio>
       <p id="playbackError" class="error-message" hidden>
         浏览器无法播放这个视频。点击下载可获取 H.264 编码的 MP4。
       </p>

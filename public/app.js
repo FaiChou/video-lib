@@ -103,9 +103,10 @@ function defaultExportSettings() {
   };
 }
 function cloneExportSettings(settings) {
+  const def = defaultExportSettings();
   return {
-    watermark: { ...settings.watermark },
-    music: { ...settings.music },
+    watermark: { ...def.watermark, ...(settings?.watermark || {}) },
+    music: { ...def.music, ...(settings?.music || {}) },
   };
 }
 const exportState = {
@@ -123,6 +124,8 @@ const auditionAudio = new Audio();
 let previewResizeObserver = null;
 let previewScrubbing = false;
 let previewBadgeRect = null;
+let playerResizeObserver = null;
+let playerScrubbing = false;
 const wmDrag = {
   active: false,
   pointerId: null,
@@ -914,7 +917,8 @@ function route() {
   state.view = upload ? "upload" : exportPage ? "export" : manage ? "manage" : "library";
   $("userFilters").hidden = !isLibrary;
   $("headerBack").hidden = isLibrary;
-  $("manageNav").hidden = !inManageSection;
+  $("manageTopbar").hidden = !inManageSection;
+  $("exportActions").hidden = !exportPage;
   $("libraryView").hidden = !isLibrary;
   $("uploadView").hidden = !upload;
   $("manageView").hidden = !manage;
@@ -943,6 +947,8 @@ function route() {
 }
 function openPlayer(video) {
   video = state.videos.find((item) => item.id === video.id) || video;
+  stopExportMedia();
+  playerScrubbing = false;
   $("playerProcessedControl").replaceChildren(processedToggle(video));
   $("playerTitle").textContent = video.name;
   $("playerMeta").textContent =
@@ -952,32 +958,61 @@ function openPlayer(video) {
   updateDownloadButton($("playerDownload"), video);
   $("playbackError").hidden = true;
   $("player").src = video.url;
+  syncPlayerAudioSource();
+  syncPlayerPlaybackUI();
   $("playerDialog").showModal();
+  drawPlayerWatermark();
   $("player")
     .play()
     .catch(() => {});
 }
 function stopPlayer() {
+  playerScrubbing = false;
+  $("playerAudio").pause();
+  if ($("playerAudio").hasAttribute("src")) {
+    $("playerAudio").removeAttribute("src");
+    $("playerAudio").load();
+  }
   $("player").pause();
+  $("player").muted = false;
   $("player").removeAttribute("src");
   $("player").load();
+  drawPlayerWatermark();
+  syncPlayerPlaybackUI();
 }
 $("closePlayer").addEventListener("click", () => $("playerDialog").close());
 $("playerDialog").addEventListener("close", stopPlayer);
 $("player").addEventListener("error", () => {
-  if ($("player").hasAttribute("src")) $("playbackError").hidden = false;
+  if ($("player").hasAttribute("src")) {
+    $("playbackError").hidden = false;
+    $("playerAudio").pause();
+    drawPlayerWatermark();
+    syncPlayerPlaybackUI();
+  }
 });
 function closeOnBackdrop(dialog, callback) {
-  dialog.addEventListener("click", (e) => {
+  if (
+    dialog.getAttribute("closedby") === "any" &&
+    "closedBy" in HTMLDialogElement.prototype
+  ) {
+    return;
+  }
+  const outside = (e) => {
     const rect = dialog.getBoundingClientRect();
-    if (
-      e.target === dialog &&
-      (e.clientX < rect.left ||
-        e.clientX > rect.right ||
-        e.clientY < rect.top ||
-        e.clientY > rect.bottom)
-    )
-      callback();
+    return (
+      e.clientX < rect.left ||
+      e.clientX > rect.right ||
+      e.clientY < rect.top ||
+      e.clientY > rect.bottom
+    );
+  };
+  let pressedOutside = false;
+  dialog.addEventListener("pointerdown", (e) => {
+    pressedOutside = e.target === dialog && outside(e);
+  });
+  dialog.addEventListener("pointerup", (e) => {
+    if (pressedOutside && e.target === dialog && outside(e)) callback();
+    pressedOutside = false;
   });
 }
 closeOnBackdrop($("playerDialog"), () => $("playerDialog").close());
@@ -1732,6 +1767,80 @@ function exportWatermarkOverlayPng(wm) {
     overlayScale,
   };
 }
+function computeContainedVideoBox(stageW, stageH, videoW, videoH) {
+  if (!(videoW > 0 && videoH > 0)) {
+    return { dispW: stageW, dispH: stageH, offX: 0, offY: 0 };
+  }
+  const videoAspect = videoW / videoH;
+  const stageAspect = stageW / stageH;
+  if (videoAspect > stageAspect) {
+    const dispW = stageW;
+    const dispH = stageW / videoAspect;
+    return { dispW, dispH, offX: 0, offY: (stageH - dispH) / 2 };
+  }
+  const dispH = stageH;
+  const dispW = stageH * videoAspect;
+  return { dispW, dispH, offX: (stageW - dispW) / 2, offY: 0 };
+}
+function sizeOverlayCanvas(canvas, box) {
+  canvas.style.left = `${box.offX}px`;
+  canvas.style.top = `${box.offY}px`;
+  canvas.style.width = `${box.dispW}px`;
+  canvas.style.height = `${box.dispH}px`;
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const pxW = Math.max(1, Math.round(box.dispW * dpr));
+  const pxH = Math.max(1, Math.round(box.dispH * dpr));
+  if (canvas.width !== pxW || canvas.height !== pxH) {
+    canvas.width = pxW;
+    canvas.height = pxH;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, pxW, pxH);
+  return { ctx, dpr, pxW, pxH };
+}
+function clearOverlayCanvas(canvas) {
+  canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+}
+function computeWatermarkLayout(wm, pxW, pxH) {
+  const scale = Math.min(pxW, pxH) / 720;
+  const badge = measureAndRenderWatermarkBadge(wm, scale);
+  const fit = Math.min(1, pxW / badge.width, pxH / badge.height);
+  const drawW = Math.max(1, Math.round(badge.width * fit));
+  const drawH = Math.max(1, Math.round(badge.height * fit));
+  const { x, y } = computePreviewWatermarkPlacement(wm, pxW, pxH, drawW, drawH);
+  return { badge, drawW, drawH, x, y };
+}
+function drawPlayerWatermark() {
+  const dialog = $("playerDialog");
+  const stage = $("playerStage");
+  const video = $("player");
+  const canvas = $("playerWatermarkCanvas");
+  const wm = exportState.saved.watermark;
+  if (
+    !dialog.open ||
+    !video.hasAttribute("src") ||
+    !$("playbackError").hidden ||
+    !(video.videoWidth > 0 && video.videoHeight > 0) ||
+    !wm.enabled ||
+    !wm.text.trim()
+  ) {
+    clearOverlayCanvas(canvas);
+    return;
+  }
+  const stageW = stage.clientWidth;
+  const stageH = stage.clientHeight;
+  if (!stageW || !stageH) return;
+  const box = computeContainedVideoBox(
+    stageW,
+    stageH,
+    video.videoWidth,
+    video.videoHeight,
+  );
+  const { ctx, pxW, pxH } = sizeOverlayCanvas(canvas, box);
+  const { badge, drawW, drawH, x, y } = computeWatermarkLayout(wm, pxW, pxH);
+  ctx.drawImage(badge, x, y, drawW, drawH);
+}
 function drawPreviewWatermark() {
   const stage = $("previewStage");
   const video = $("previewVideo");
@@ -1740,39 +1849,10 @@ function drawPreviewWatermark() {
   const stageH = stage.clientHeight;
   if (!stageW || !stageH) return;
 
-  let dispW = stageW;
-  let dispH = stageH;
-  let offX = 0;
-  let offY = 0;
-  if (!video.hidden && video.videoWidth > 0 && video.videoHeight > 0) {
-    const videoAspect = video.videoWidth / video.videoHeight;
-    const stageAspect = stageW / stageH;
-    if (videoAspect > stageAspect) {
-      dispW = stageW;
-      dispH = stageW / videoAspect;
-      offY = (stageH - dispH) / 2;
-    } else {
-      dispH = stageH;
-      dispW = stageH * videoAspect;
-      offX = (stageW - dispW) / 2;
-    }
-  }
-
-  canvas.style.left = `${offX}px`;
-  canvas.style.top = `${offY}px`;
-  canvas.style.width = `${dispW}px`;
-  canvas.style.height = `${dispH}px`;
-
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const pxW = Math.max(1, Math.round(dispW * dpr));
-  const pxH = Math.max(1, Math.round(dispH * dpr));
-  if (canvas.width !== pxW || canvas.height !== pxH) {
-    canvas.width = pxW;
-    canvas.height = pxH;
-  }
-
-  const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, pxW, pxH);
+  const box = video.hidden
+    ? { dispW: stageW, dispH: stageH, offX: 0, offY: 0 }
+    : computeContainedVideoBox(stageW, stageH, video.videoWidth, video.videoHeight);
+  const { ctx, dpr, pxW, pxH } = sizeOverlayCanvas(canvas, box);
 
   const wm = exportState.draft.watermark;
   const draggable = Boolean(wm.enabled && wm.text.trim());
@@ -1784,20 +1864,15 @@ function drawPreviewWatermark() {
     return;
   }
 
-  const scale = Math.min(pxW, pxH) / 720;
-  const badge = measureAndRenderWatermarkBadge(wm, scale);
-  const fit = Math.min(1, pxW / badge.width, pxH / badge.height);
-  const drawW = Math.max(1, Math.round(badge.width * fit));
-  const drawH = Math.max(1, Math.round(badge.height * fit));
-  const { x, y } = computePreviewWatermarkPlacement(wm, pxW, pxH, drawW, drawH);
+  const { badge, drawW, drawH, x, y } = computeWatermarkLayout(wm, pxW, pxH);
 
   previewBadgeRect = {
     x: x / dpr,
     y: y / dpr,
     w: drawW / dpr,
     h: drawH / dpr,
-    canvasW: dispW,
-    canvasH: dispH,
+    canvasW: box.dispW,
+    canvasH: box.dispH,
   };
 
   if (wmDrag.active && (wmDrag.snapX || wmDrag.snapY)) {
@@ -1838,29 +1913,61 @@ function drawPreviewWatermark() {
     ctx.restore();
   }
 }
-function syncPreviewPlaybackUI() {
-  const videoEl = $("previewVideo");
-  const playBtn = $("previewPlayToggle");
-  const seek = $("previewSeek");
-  const timeEl = $("previewTime");
-  const hasVideo = state.videos.length > 0 && !videoEl.hidden;
+function syncRangePlaybackUI({
+  videoEl,
+  playBtn,
+  seekEl,
+  timeEl,
+  hasVideo,
+  scrubbing,
+  playLabel,
+  pauseLabel,
+}) {
   const playing = hasVideo && !videoEl.paused && !videoEl.ended;
-
   playBtn.disabled = !hasVideo;
   playBtn.replaceChildren(icon(playing ? "pause" : "play"));
-  playBtn.setAttribute("aria-label", playing ? "暂停预览" : "播放预览");
+  playBtn.setAttribute("aria-label", playing ? pauseLabel : playLabel);
   playBtn.title = playing ? "暂停" : "播放";
 
-  const dur = Number.isFinite(videoEl.duration) && videoEl.duration > 0 ? videoEl.duration : 0;
+  const dur =
+    Number.isFinite(videoEl.duration) && videoEl.duration > 0
+      ? videoEl.duration
+      : 0;
   const cur = Number.isFinite(videoEl.currentTime) ? videoEl.currentTime : 0;
   const timeText = `${formatClock(cur)} / ${formatClock(dur)}`;
   timeEl.textContent = timeText;
 
-  seek.disabled = !hasVideo || !dur;
-  if (!previewScrubbing) {
-    seek.value = dur > 0 ? String(Math.round((cur / dur) * 1000)) : "0";
-    syncRangeSlider(seek, timeText);
+  seekEl.disabled = !hasVideo || !dur;
+  if (!scrubbing) {
+    seekEl.value = dur > 0 ? String(Math.round((cur / dur) * 1000)) : "0";
+    syncRangeSlider(seekEl, timeText);
   }
+}
+function syncPreviewPlaybackUI() {
+  const videoEl = $("previewVideo");
+  syncRangePlaybackUI({
+    videoEl,
+    playBtn: $("previewPlayToggle"),
+    seekEl: $("previewSeek"),
+    timeEl: $("previewTime"),
+    hasVideo: state.videos.length > 0 && !videoEl.hidden,
+    scrubbing: previewScrubbing,
+    playLabel: "播放预览",
+    pauseLabel: "暂停预览",
+  });
+}
+function syncPlayerPlaybackUI() {
+  const videoEl = $("player");
+  syncRangePlaybackUI({
+    videoEl,
+    playBtn: $("playerPlayToggle"),
+    seekEl: $("playerSeek"),
+    timeEl: $("playerTime"),
+    hasVideo: videoEl.hasAttribute("src") && $("playbackError").hidden,
+    scrubbing: playerScrubbing,
+    playLabel: "播放视频",
+    pauseLabel: "暂停视频",
+  });
 }
 function syncPreviewVideo() {
   const videoEl = $("previewVideo");
@@ -1893,31 +2000,29 @@ function syncPreviewVideo() {
   $("previewVideoMeta").textContent = `${active.user} / ${active.name}${resText}`;
   syncPreviewPlaybackUI();
 }
-function syncPreviewAudioSource() {
-  const videoEl = $("previewVideo");
-  const audioEl = $("previewAudio");
-  const mu = exportState.draft.music;
+function applyMusicSourceToMedia(videoEl, audioEl, mu) {
   const track = exportState.music.find((item) => item.name === mu.file);
-  videoEl.muted = Boolean(mu.enabled && mu.keepOriginalAudio === false);
+  const hasMusic = Boolean(mu.enabled && track);
+  videoEl.muted = Boolean(hasMusic && mu.keepOriginalAudio === false);
   audioEl.volume = Math.max(0, Math.min(1, mu.volume));
   audioEl.loop = Boolean(mu.loop);
-  if (!mu.enabled || !track) {
+  audioEl.playbackRate = videoEl.playbackRate || 1;
+  if (!hasMusic) {
     audioEl.pause();
     if (audioEl.hasAttribute("src")) {
       audioEl.removeAttribute("src");
       audioEl.load();
     }
-    return;
+    return false;
   }
   if (audioEl.getAttribute("src") !== track.url) {
     audioEl.src = track.url;
   }
+  return true;
 }
-function syncPreviewAudioPlayback() {
-  const videoEl = $("previewVideo");
-  const audioEl = $("previewAudio");
-  const mu = exportState.draft.music;
+function syncMusicPlaybackWithVideo(videoEl, audioEl, mu, active = true) {
   if (
+    !active ||
     !mu.enabled ||
     !mu.file ||
     !audioEl.hasAttribute("src") ||
@@ -1925,25 +2030,65 @@ function syncPreviewAudioPlayback() {
     videoEl.ended
   ) {
     audioEl.pause();
-    return;
-  }
-  auditionAudio.pause();
-  if (exportState.auditionName) {
-    exportState.auditionName = "";
-    renderMusicList();
+    return false;
   }
   const dur = audioEl.duration;
   if (Number.isFinite(dur) && dur > 0) {
     if (!mu.loop && videoEl.currentTime >= dur) {
       audioEl.pause();
-      return;
+      return false;
     }
     const target = mu.loop ? videoEl.currentTime % dur : videoEl.currentTime;
     if (Math.abs(audioEl.currentTime - target) > 0.25) {
       audioEl.currentTime = target;
     }
   }
+  audioEl.playbackRate = videoEl.playbackRate || 1;
   audioEl.play().catch(() => {});
+  return true;
+}
+function syncPreviewAudioSource() {
+  applyMusicSourceToMedia(
+    $("previewVideo"),
+    $("previewAudio"),
+    exportState.draft.music,
+  );
+}
+function syncPreviewAudioPlayback() {
+  const started = syncMusicPlaybackWithVideo(
+    $("previewVideo"),
+    $("previewAudio"),
+    exportState.draft.music,
+    state.view === "export",
+  );
+  if (started) {
+    auditionAudio.pause();
+    if (exportState.auditionName) {
+      exportState.auditionName = "";
+      renderMusicList();
+    }
+  }
+}
+function syncPlayerAudioSource() {
+  applyMusicSourceToMedia(
+    $("player"),
+    $("playerAudio"),
+    exportState.saved.music,
+  );
+}
+function syncPlayerAudioPlayback() {
+  syncMusicPlaybackWithVideo(
+    $("player"),
+    $("playerAudio"),
+    exportState.saved.music,
+    $("playerDialog").open && $("playbackError").hidden,
+  );
+}
+function refreshPlayerEffects() {
+  if (!$("playerDialog").open) return;
+  syncPlayerAudioSource();
+  syncPlayerAudioPlayback();
+  drawPlayerWatermark();
 }
 function renderPreviewSummary() {
   const wm = exportState.draft.watermark;
@@ -2071,6 +2216,7 @@ async function deleteMusicFile(name) {
     exportState.music = exportState.music.filter((t) => t.name !== name);
     downloads.clear();
     updateExportActiveBadge();
+    refreshPlayerEffects();
     renderExportPage();
     showToast(`已删除背景音乐 ${name}`);
   } catch (error) {
@@ -2174,13 +2320,9 @@ async function uploadMusicFiles(fileList) {
 }
 function renderExportStatus() {
   const dirty = isExportDirty();
-  $("exportDirtyState").textContent = exportState.saving
-    ? "正在保存…"
-    : dirty
-      ? "有未保存更改"
-      : "已保存";
-  $("exportDirtyState").classList.toggle("is-dirty", dirty && !exportState.saving);
-  $("exportSave").disabled = exportState.saving;
+  const saveBtn = $("exportSave");
+  saveBtn.disabled = exportState.saving || !dirty;
+  saveBtn.textContent = exportState.saving ? "保存中…" : "保存设置";
   $("exportReset").disabled = exportState.saving;
   renderPreviewSummary();
 }
@@ -2279,6 +2421,7 @@ async function loadExportSettings({ silent = false } = {}) {
     exportState.loaded = true;
     exportState.loadError = "";
     updateExportActiveBadge();
+    refreshPlayerEffects();
     if (state.view === "export") renderExportPage();
   } catch (error) {
     exportState.loadError = error.message;
@@ -2287,7 +2430,7 @@ async function loadExportSettings({ silent = false } = {}) {
   }
 }
 async function saveExportSettings() {
-  if (exportState.saving) return;
+  if (exportState.saving || !isExportDirty()) return;
   $("exportError").hidden = true;
   const wm = exportState.draft.watermark;
   const mu = exportState.draft.music;
@@ -2321,6 +2464,7 @@ async function saveExportSettings() {
     exportState.draft = cloneExportSettings(data.settings);
     downloads.clear();
     updateExportActiveBadge();
+    refreshPlayerEffects();
     renderExportPage();
     showToast("水印与音乐设置已保存，所有下载将按新设置处理");
   } catch (error) {
@@ -2413,38 +2557,129 @@ $("deleteDialog").addEventListener("cancel", (event) => {
 $("deleteDialog").addEventListener("close", () => { deleteTargets = []; });
 closeOnBackdrop($("deleteDialog"), closeDelete);
 
-// Export settings page events
-$("previewPlayToggle").addEventListener("click", () => {
-  const videoEl = $("previewVideo");
-  if (!state.videos.length || videoEl.hidden) return;
+function toggleVideoPlayback(videoEl) {
+  if (!videoEl.hasAttribute("src") || videoEl.hidden) return;
   if (videoEl.paused || videoEl.ended) {
     videoEl.play().catch(() => {});
   } else {
     videoEl.pause();
   }
-});
-$("previewSeek").addEventListener("pointerdown", () => {
-  previewScrubbing = true;
-});
-for (const ev of ["pointerup", "pointercancel"]) {
-  $("previewSeek").addEventListener(ev, () => {
-    previewScrubbing = false;
+}
+function bindSeekScrubber({
+  seekEl,
+  videoEl,
+  timeEl,
+  setScrubbing,
+  syncUI,
+  syncAudio,
+}) {
+  seekEl.addEventListener("pointerdown", () => setScrubbing(true));
+  for (const ev of ["pointerup", "pointercancel"]) {
+    seekEl.addEventListener(ev, () => setScrubbing(false));
+  }
+  seekEl.addEventListener("input", () => {
+    const dur = Number.isFinite(videoEl.duration) ? videoEl.duration : 0;
+    if (!dur) return;
+    const target = (Number(seekEl.value) / 1000) * dur;
+    videoEl.currentTime = target;
+    const timeText = `${formatClock(target)} / ${formatClock(dur)}`;
+    timeEl.textContent = timeText;
+    syncRangeSlider(seekEl, timeText);
+    syncAudio();
+  });
+  seekEl.addEventListener("change", () => {
+    setScrubbing(false);
+    syncUI();
   });
 }
-$("previewSeek").addEventListener("input", () => {
-  const videoEl = $("previewVideo");
-  const dur = Number.isFinite(videoEl.duration) ? videoEl.duration : 0;
-  if (!dur) return;
-  const target = (Number($("previewSeek").value) / 1000) * dur;
-  videoEl.currentTime = target;
-  const timeText = `${formatClock(target)} / ${formatClock(dur)}`;
-  $("previewTime").textContent = timeText;
-  syncRangeSlider($("previewSeek"), timeText);
-  syncPreviewAudioPlayback();
+
+// Library player dialog events
+$("playerPlayToggle").addEventListener("click", () => {
+  toggleVideoPlayback($("player"));
 });
-$("previewSeek").addEventListener("change", () => {
-  previewScrubbing = false;
-  syncPreviewPlaybackUI();
+$("player").addEventListener("click", () => {
+  toggleVideoPlayback($("player"));
+});
+bindSeekScrubber({
+  seekEl: $("playerSeek"),
+  videoEl: $("player"),
+  timeEl: $("playerTime"),
+  setScrubbing: (v) => {
+    playerScrubbing = v;
+  },
+  syncUI: syncPlayerPlaybackUI,
+  syncAudio: syncPlayerAudioPlayback,
+});
+for (const ev of ["loadedmetadata", "resize"]) {
+  $("player").addEventListener(ev, () => {
+    syncPlayerPlaybackUI();
+    drawPlayerWatermark();
+  });
+}
+for (const ev of ["timeupdate", "durationchange"]) {
+  $("player").addEventListener(ev, syncPlayerPlaybackUI);
+}
+for (const ev of ["playing", "seeked"]) {
+  $("player").addEventListener(ev, () => {
+    syncPlayerPlaybackUI();
+    syncPlayerAudioPlayback();
+  });
+}
+$("player").addEventListener("play", syncPlayerPlaybackUI);
+$("player").addEventListener("waiting", () => {
+  $("playerAudio").pause();
+});
+for (const ev of ["pause", "ended"]) {
+  $("player").addEventListener(ev, () => {
+    syncPlayerPlaybackUI();
+    $("playerAudio").pause();
+  });
+}
+$("player").addEventListener("ratechange", () => {
+  $("playerAudio").playbackRate = $("player").playbackRate || 1;
+});
+$("playerAudio").addEventListener("loadedmetadata", syncPlayerAudioPlayback);
+$("playerDialog").addEventListener("keydown", (e) => {
+  const player = $("player");
+  if (!player.hasAttribute("src") || !$("playbackError").hidden) return;
+  if (
+    e.code === "Space" &&
+    (e.target === $("playerDialog") ||
+      e.target === $("playerStage") ||
+      e.target === player)
+  ) {
+    e.preventDefault();
+    toggleVideoPlayback(player);
+    return;
+  }
+  if (
+    (e.key === "ArrowLeft" || e.key === "ArrowRight") &&
+    e.target !== $("playerSeek")
+  ) {
+    const dur = Number.isFinite(player.duration) ? player.duration : 0;
+    if (!dur) return;
+    e.preventDefault();
+    const delta = e.key === "ArrowRight" ? 5 : -5;
+    player.currentTime = Math.max(0, Math.min(dur, player.currentTime + delta));
+    syncPlayerPlaybackUI();
+    syncPlayerAudioPlayback();
+  }
+});
+
+// Export settings page events
+$("previewPlayToggle").addEventListener("click", () => {
+  if (!state.videos.length) return;
+  toggleVideoPlayback($("previewVideo"));
+});
+bindSeekScrubber({
+  seekEl: $("previewSeek"),
+  videoEl: $("previewVideo"),
+  timeEl: $("previewTime"),
+  setScrubbing: (v) => {
+    previewScrubbing = v;
+  },
+  syncUI: syncPreviewPlaybackUI,
+  syncAudio: syncPreviewAudioPlayback,
 });
 $("previewVideo").addEventListener("loadedmetadata", () => {
   const active = state.videos[0];
@@ -2474,6 +2709,7 @@ $("previewVideo").addEventListener("seeked", () => {
   syncPreviewPlaybackUI();
   syncPreviewAudioPlayback();
 });
+$("previewAudio").addEventListener("loadedmetadata", syncPreviewAudioPlayback);
 auditionAudio.addEventListener("ended", () => {
   exportState.auditionName = "";
   renderMusicList();
@@ -2483,6 +2719,10 @@ if (typeof ResizeObserver === "function") {
     if (state.view === "export") drawPreviewWatermark();
   });
   previewResizeObserver.observe($("previewStage"));
+  playerResizeObserver = new ResizeObserver(() => {
+    if ($("playerDialog").open) drawPlayerWatermark();
+  });
+  playerResizeObserver.observe($("playerStage"));
 }
 
 function hitTestPreviewBadge(ptX, ptY, padding = 0) {
@@ -2626,7 +2866,8 @@ for (const [id, field, scale, unit] of [
 ]) {
   $(id).addEventListener("input", () => {
     const raw = Number($(id).value);
-    exportState.draft.watermark[field] = scale === 1 ? Math.round(raw) : raw * scale;
+    exportState.draft.watermark[field] =
+      scale === 1 ? Math.round(raw) : Math.round(raw) / 100;
     const text = `${raw}${unit}`;
     $(`${id}Value`).textContent = text;
     syncRangeSlider($(id), text);
