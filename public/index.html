@@ -164,7 +164,6 @@
         <div class="export-header">
           <div class="export-heading">
             <h1>下载导出处理：水印与音乐</h1>
-            <p>开启后，视频库中所有视频在点击下载时都会通过 Mediabunny 处理后导出，原视频文件保持不变。</p>
           </div>
           <div class="export-actions">
             <span id="exportDirtyState" class="export-dirty-state" role="status" aria-live="polite">已保存</span>
@@ -181,19 +180,23 @@
                   <span data-icon="play"></span>
                   <strong>实时预览</strong>
                 </div>
-                <label class="sort-control preview-video-picker">
-                  <span data-icon="film"></span>
-                  <select id="previewVideoSelect" aria-label="选择预览示例视频"></select>
-                </label>
+                <span id="previewDragHint" class="preview-drag-hint" hidden>拖动画面上的水印调整位置</span>
               </div>
               <div id="previewStage" class="preview-stage">
-                <video id="previewVideo" controls playsinline preload="metadata"></video>
+                <video id="previewVideo" playsinline preload="metadata"></video>
                 <div id="previewEmpty" class="preview-empty" hidden>
                   <span data-icon="film"></span>
                   <strong>暂无示例视频</strong>
                   <span>上传视频后，默认使用视频库中的第一个视频实时预览水印和背景音乐。</span>
                 </div>
-                <canvas id="previewCanvas" class="preview-watermark-canvas" aria-hidden="true"></canvas>
+                <canvas id="previewCanvas" class="preview-watermark-canvas" tabindex="0" aria-label="水印位置预览，可拖动或使用方向键调整位置"></canvas>
+              </div>
+              <div id="previewControls" class="preview-controls">
+                <button type="button" id="previewPlayToggle" class="icon-button preview-play-btn" aria-label="播放预览" title="播放">
+                  <span data-icon="play"></span>
+                </button>
+                <input id="previewSeek" class="export-range preview-seek" type="range" min="0" max="1000" step="1" value="0" aria-label="播放进度" />
+                <span id="previewTime" class="preview-time">0:00 / 0:00</span>
               </div>
               <audio id="previewAudio" preload="auto"></audio>
               <div class="preview-meta-bar">
@@ -294,35 +297,7 @@
                     <input id="wmOpacity" class="export-range" type="range" min="10" max="100" step="1" value="100" />
                   </div>
                 </div>
-                <div class="field-block">
-                  <span class="field-label" id="wmPositionLabel">水印位置</span>
-                  <div id="wmPositionGrid" class="position-grid" role="group" aria-labelledby="wmPositionLabel">
-                    <button type="button" data-position="top-left" aria-pressed="false">左上</button>
-                    <button type="button" data-position="top-center" aria-pressed="false">上中</button>
-                    <button type="button" data-position="top-right" aria-pressed="false">右上</button>
-                    <button type="button" data-position="middle-left" aria-pressed="false">左中</button>
-                    <button type="button" data-position="center" aria-pressed="false">居中</button>
-                    <button type="button" data-position="middle-right" aria-pressed="false">右中</button>
-                    <button type="button" data-position="bottom-left" aria-pressed="false">左下</button>
-                    <button type="button" data-position="bottom-center" aria-pressed="false">下中</button>
-                    <button type="button" data-position="bottom-right" aria-pressed="true">右下</button>
-                  </div>
-                </div>
                 <div class="field-grid-2">
-                  <div class="field-block">
-                    <div class="range-head">
-                      <label class="field-label" for="wmMarginX">水平边距</label>
-                      <span id="wmMarginXValue" class="range-value">24 px</span>
-                    </div>
-                    <input id="wmMarginX" class="export-range" type="range" min="0" max="200" step="1" value="24" />
-                  </div>
-                  <div class="field-block">
-                    <div class="range-head">
-                      <label class="field-label" for="wmMarginY">垂直边距</label>
-                      <span id="wmMarginYValue" class="range-value">24 px</span>
-                    </div>
-                    <input id="wmMarginY" class="export-range" type="range" min="0" max="200" step="1" value="24" />
-                  </div>
                   <div class="field-block">
                     <div class="range-head">
                       <label class="field-label" for="wmPaddingX">左右内边距</label>
@@ -344,7 +319,7 @@
               <div class="settings-card-head">
                 <div>
                   <h2 id="musicCardTitle">背景音乐</h2>
-                  <p>上传并管理 MP3 曲库，下载时与视频原声混合导出。</p>
+                  <p>上传并管理 MP3 曲库，下载时可与视频原声混合或替换原声。</p>
                 </div>
                 <button
                   type="button"
@@ -377,6 +352,23 @@
                     <span id="musicVolumeValue" class="range-value">35%</span>
                   </div>
                   <input id="musicVolume" class="export-range" type="range" min="0" max="100" step="1" value="35" />
+                </div>
+                <div class="field-row-between">
+                  <div>
+                    <span class="field-label" id="musicKeepOriginalLabel">保留视频原声</span>
+                    <p class="field-help">关闭后将静音原视频声音，仅保留背景音乐。</p>
+                  </div>
+                  <button
+                    type="button"
+                    id="musicKeepOriginal"
+                    class="processed-toggle field-switch"
+                    role="switch"
+                    aria-checked="true"
+                    aria-labelledby="musicKeepOriginalLabel"
+                  >
+                    <span class="processed-track" aria-hidden="true"></span>
+                    <span class="processed-label">保留原声</span>
+                  </button>
                 </div>
                 <div class="field-row-between">
                   <div>

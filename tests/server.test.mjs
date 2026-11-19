@@ -1233,10 +1233,12 @@ test("export routes and settings API validate inputs, persist across restart, an
     ["enabled music without file", { watermark: { enabled: false }, music: { enabled: true, file: "" } }, 400],
     ["missing music file", { watermark: { enabled: false }, music: { enabled: true, file: "nope.mp3" } }, 400],
     ["bad color", { watermark: { enabled: true, text: "hi", color: "red" }, music: { enabled: false } }, 400],
-    ["bad position", { watermark: { enabled: true, text: "hi", position: "nowhere" }, music: { enabled: false } }, 400],
+    ["bad x coordinate", { watermark: { enabled: true, text: "hi", x: 1.5, y: 0.5 }, music: { enabled: false } }, 400],
+    ["bad y coordinate", { watermark: { enabled: true, text: "hi", x: 0.5, y: -0.1 }, music: { enabled: false } }, 400],
     ["bad font size", { watermark: { enabled: true, text: "hi", fontSize: 5 }, music: { enabled: false } }, 400],
     ["bad border radius", { watermark: { enabled: true, text: "hi", borderRadius: 200 }, music: { enabled: false } }, 400],
     ["bad volume", { watermark: { enabled: false }, music: { enabled: false, volume: 1.5 } }, 400],
+    ["bad keepOriginalAudio", { watermark: { enabled: false }, music: { enabled: false, keepOriginalAudio: "yes" } }, 400],
     ["bad png", { settings: { watermark: { enabled: true, text: "hi" }, music: { enabled: false } }, overlayPng: "not-png" }, 400],
   ]) {
     const res = await fetch(`${base}/api/export-settings`, {
@@ -1257,7 +1259,7 @@ test("export routes and settings API validate inputs, persist across restart, an
     403,
   );
 
-  // Valid save with PNG overlay
+  // Valid save with PNG overlay & normalized drag coords
   const png = makePngBuffer(120, 40);
   const saveRes = await fetch(`${base}/api/export-settings`, {
     method: "PUT",
@@ -1276,15 +1278,15 @@ test("export routes and settings API validate inputs, persist across restart, an
           paddingX: 20,
           paddingY: 10,
           opacity: 0.9,
-          position: "top-left",
-          marginX: 30,
-          marginY: 20,
+          x: 0.25,
+          y: 0.75,
         },
         music: {
           enabled: true,
           file: "theme.mp3",
           volume: 0.45,
           loop: false,
+          keepOriginalAudio: false,
         },
       },
       overlayPng: png.toString("base64"),
@@ -1295,8 +1297,11 @@ test("export routes and settings API validate inputs, persist across restart, an
   const saved = (await saveRes.json()).settings;
   assert.equal(saved.watermark.color, "#ffee00");
   assert.equal(saved.watermark.bold, true);
+  assert.equal(saved.watermark.x, 0.25);
+  assert.equal(saved.watermark.y, 0.75);
   assert.equal(saved.music.file, "theme.mp3");
   assert.equal(saved.music.loop, false);
+  assert.equal(saved.music.keepOriginalAudio, false);
 
   // Restart server and verify persistence
   server.closeAllConnections();
@@ -1317,8 +1322,27 @@ test("export routes and settings API validate inputs, persist across restart, an
   assert.deepEqual(afterRestart.settings, saved);
   assert.equal(afterRestart.music.length, 1);
 
-  // Invalid .export-settings.json fails startup without overwriting
+  // Legacy .export-settings.json with position migrates cleanly to x/y and keepOriginalAudio
   const settingsFile = path.join(videoDir, ".export-settings.json");
+  await writeFile(settingsFile, JSON.stringify({
+    watermark: { enabled: true, text: "legacy", position: "top-left" },
+    music: { enabled: false },
+  }));
+  const migratedSrv = await createVideoServer({ videoDir, publicDir });
+  migratedSrv.listen(0, "127.0.0.1");
+  await once(migratedSrv, "listening");
+  try {
+    const mBase = `http://127.0.0.1:${migratedSrv.address().port}`;
+    const migrated = (await (await fetch(`${mBase}/api/export-settings`)).json()).settings;
+    assert.equal(migrated.watermark.x, 0.06);
+    assert.equal(migrated.watermark.y, 0.06);
+    assert.equal(migrated.music.keepOriginalAudio, true);
+  } finally {
+    migratedSrv.closeAllConnections();
+    await new Promise((resolve) => migratedSrv.close(resolve));
+  }
+
+  // Invalid .export-settings.json fails startup without overwriting
   await writeFile(settingsFile, "{broken");
   await assert.rejects(createVideoServer({ videoDir, publicDir }), /无法读取导出设置/);
   assert.equal(await readFile(settingsFile, "utf8"), "{broken");
@@ -1474,15 +1498,15 @@ test("downloads apply mediabunny watermark + MP3 music to compatible MP4s, cache
           paddingX: 16,
           paddingY: 8,
           opacity: 1,
-          position: "top-left",
-          marginX: 20,
-          marginY: 20,
+          x: 0.1,
+          y: 0.1,
         },
         music: {
           enabled: true,
           file: "loop.mp3",
           volume: 0.5,
           loop: true,
+          keepOriginalAudio: true,
         },
       },
       overlayPng: bluePng.toString("base64"),
@@ -1520,8 +1544,8 @@ test("downloads apply mediabunny watermark + MP3 music to compatible MP4s, cache
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       settings: {
-        watermark: { enabled: true, text: "VARIANT2", position: "bottom-right" },
-        music: { enabled: false, file: "loop.mp3", volume: 0.5, loop: true },
+        watermark: { enabled: true, text: "VARIANT2", x: 0.8, y: 0.8 },
+        music: { enabled: false, file: "loop.mp3", volume: 0.5, loop: true, keepOriginalAudio: false },
       },
     }),
   });

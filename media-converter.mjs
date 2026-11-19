@@ -312,6 +312,23 @@ export function computeWatermarkPlacement(
   badgeHeight,
 ) {
   const scale = Math.min(videoWidth, videoHeight) / REF_SHORT_EDGE;
+  if (
+    typeof watermark.x === "number" &&
+    Number.isFinite(watermark.x) &&
+    typeof watermark.y === "number" &&
+    Number.isFinite(watermark.y)
+  ) {
+    const rx = Math.max(0, Math.min(1, watermark.x));
+    const ry = Math.max(0, Math.min(1, watermark.y));
+    return {
+      x: Math.round(rx * Math.max(0, videoWidth - badgeWidth)),
+      y: Math.round(ry * Math.max(0, videoHeight - badgeHeight)),
+      marginX: 0,
+      marginY: 0,
+      scale,
+    };
+  }
+
   const marginX = Math.max(0, Math.round((watermark.marginX ?? 24) * scale));
   const marginY = Math.max(0, Math.round((watermark.marginY ?? 24) * scale));
   const pos = watermark.position || "bottom-right";
@@ -431,8 +448,17 @@ async function buildWatermarkBadge({
   overlayScale = 3,
 }) {
   const scale = Math.min(videoWidth, videoHeight) / REF_SHORT_EDGE;
-  const marginX = Math.max(0, Math.round((watermark.marginX ?? 24) * scale));
-  const marginY = Math.max(0, Math.round((watermark.marginY ?? 24) * scale));
+  const usesCoords =
+    typeof watermark.x === "number" &&
+    Number.isFinite(watermark.x) &&
+    typeof watermark.y === "number" &&
+    Number.isFinite(watermark.y);
+  const marginX = usesCoords
+    ? 0
+    : Math.max(0, Math.round((watermark.marginX ?? 24) * scale));
+  const marginY = usesCoords
+    ? 0
+    : Math.max(0, Math.round((watermark.marginY ?? 24) * scale));
   const maxBadgeW = Math.max(1, videoWidth - marginX * 2);
   const maxBadgeH = Math.max(1, videoHeight - marginY * 2);
 
@@ -1151,7 +1177,9 @@ export async function normalizeVideo({
     const videoDuration =
       (primaryVideo ? await primaryVideo.computeDuration() : 0) ||
       (await input.computeDuration());
-    const hasOriginalAudio = (await input.getAudioTracks()).length > 0;
+    const keepOriginalAudio = music.keepOriginalAudio !== false;
+    const hasOriginalAudio =
+      keepOriginalAudio && (await input.getAudioTracks()).length > 0;
 
     conversion = await Conversion.init({
       input,

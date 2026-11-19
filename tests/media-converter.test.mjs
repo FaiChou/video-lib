@@ -475,7 +475,7 @@ test("normalizeVideo applies server text watermark and PNG overlay onto H.264 MP
   }
   assert.ok(changed > 10, "expected watermark to modify visible video pixels");
 
-  // 2. High-DPI browser PNG overlay path
+  // 2. High-DPI browser PNG overlay path using normalized drag coordinates (x, y)
   const pngOpts = await fixture(t, "vp9-silent-odd.webm");
   const redPng = createSolidPng(180, 90, 255, 0, 0, 220);
   const pngMeta = await validateOverlayPng(redPng);
@@ -485,9 +485,8 @@ test("normalizeVideo applies server text watermark and PNG overlay onto H.264 MP
     watermark: {
       enabled: true,
       text: "PNG",
-      position: "top-left",
-      marginX: 30,
-      marginY: 30,
+      x: 0.1,
+      y: 0.1,
     },
     watermarkOverlay: redPng,
     watermarkOverlayScale: 1,
@@ -495,9 +494,8 @@ test("normalizeVideo applies server text watermark and PNG overlay onto H.264 MP
   assert.deepEqual(pngResult, { converted: true });
   await assertMedia(t, pngOpts.outputPath, { width: 66, height: 50, audio: false });
   const overlaid = await readFrameRgba(pngOpts.outputPath, 0);
-  // Check pixel near top-left margin (scale = 50 / 720 ~ 0.07 -> margin ~ 2, badge ~ 12x6)
-  const off = (4 * overlaid.width + 6) * 4;
-  assert.ok(overlaid.rgba[off] > 170 && overlaid.rgba[off + 2] < 80, "expected red PNG overlay near top-left");
+  const off = (6 * overlaid.width + 8) * 4;
+  assert.ok(overlaid.rgba[off] > 170 && overlaid.rgba[off + 2] < 80, "expected red PNG overlay near drag coordinate");
 });
 
 test("normalizeVideo mixes looping MP3 background music into both audio and silent videos and combined watermark+music", async (t) => {
@@ -553,6 +551,23 @@ test("normalizeVideo mixes looping MP3 background music into both audio and sile
   assert.deepEqual(comboRes, { converted: true });
   assert.equal(progress.at(-1), 1);
   await assertMedia(t, comboOpts.outputPath, { width: 64, height: 48, audio: true });
+
+  // keepOriginalAudio: false mutes original video audio completely when music volume is 0
+  const mutedOpts = await fixture(t, "h264-aac.mp4");
+  const mutedRes = await normalizeVideo({
+    ...mutedOpts,
+    music: { handle: musicHandle, volume: 0, loop: false, keepOriginalAudio: false },
+  });
+  assert.deepEqual(mutedRes, { converted: true });
+  const mutedInput = inspect(t, mutedOpts.outputPath);
+  const mutedTrack = await mutedInput.getPrimaryAudioTrack();
+  const mutedSample = await new AudioSampleSink(mutedTrack).getSample(0.2);
+  assert.ok(mutedSample);
+  const mutedF32 = new Float32Array(mutedSample.allocationSize({ planeIndex: 0, format: "f32" }) / 4);
+  mutedSample.copyTo(mutedF32, { planeIndex: 0, format: "f32" });
+  mutedSample.close();
+  const maxAmp = mutedF32.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  assert.ok(maxAmp < 0.005, `expected original audio to be muted, got maxAmp=${maxAmp}`);
 });
 
 test("cancellation during watermark + music conversion removes partial output", async (t) => {

@@ -27,17 +27,6 @@ const DEFAULT_HOST = "0.0.0.0";
 const MAX_LIMIT = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_MUSIC_BYTES = 50 * 1024 * 1024;
 const MAX_SETTINGS_BODY_BYTES = 3 * 1024 * 1024;
-const WATERMARK_POSITIONS = new Set([
-  "top-left",
-  "top-center",
-  "top-right",
-  "middle-left",
-  "center",
-  "middle-right",
-  "bottom-left",
-  "bottom-center",
-  "bottom-right",
-]);
 const DEFAULT_EXPORT_SETTINGS = Object.freeze({
   watermark: Object.freeze({
     enabled: false,
@@ -51,15 +40,15 @@ const DEFAULT_EXPORT_SETTINGS = Object.freeze({
     paddingX: 16,
     paddingY: 8,
     opacity: 1,
-    position: "bottom-right",
-    marginX: 24,
-    marginY: 24,
+    x: 0.92,
+    y: 0.92,
   }),
   music: Object.freeze({
     enabled: false,
     file: "",
     volume: 0.35,
     loop: true,
+    keepOriginalAudio: true,
   }),
 });
 const VIDEO_TYPES = new Map([
@@ -208,10 +197,22 @@ function validateExportSettings(raw, { requireAssets = false } = {}) {
   const bold = wmRaw.bold === undefined ? wmDef.bold : wmRaw.bold;
   if (typeof bold !== "boolean") fail("水印加粗选项必须是布尔值。");
 
-  const position = wmRaw.position === undefined ? wmDef.position : wmRaw.position;
-  if (typeof position !== "string" || !WATERMARK_POSITIONS.has(position)) {
-    fail("水印位置无效。");
+  let fallbackX = wmDef.x;
+  let fallbackY = wmDef.y;
+  if (typeof wmRaw.position === "string") {
+    fallbackX = wmRaw.position.endsWith("-left")
+      ? 0.06
+      : wmRaw.position.endsWith("-right")
+        ? 0.94
+        : 0.5;
+    fallbackY = wmRaw.position.startsWith("top-")
+      ? 0.06
+      : wmRaw.position.startsWith("bottom-")
+        ? 0.94
+        : 0.5;
   }
+  const x = Math.round(validateNumberField(wmRaw.x, fallbackX, 0, 1, "水印水平位置", fail) * 10000) / 10000;
+  const y = Math.round(validateNumberField(wmRaw.y, fallbackY, 0, 1, "水印垂直位置", fail) * 10000) / 10000;
 
   const watermark = {
     enabled: wmEnabled,
@@ -225,9 +226,8 @@ function validateExportSettings(raw, { requireAssets = false } = {}) {
     paddingX: Math.round(validateNumberField(wmRaw.paddingX, wmDef.paddingX, 0, 80, "水印水平内边距", fail)),
     paddingY: Math.round(validateNumberField(wmRaw.paddingY, wmDef.paddingY, 0, 60, "水印垂直内边距", fail)),
     opacity: validateNumberField(wmRaw.opacity, wmDef.opacity, 0.1, 1, "水印整体透明度", fail),
-    position,
-    marginX: Math.round(validateNumberField(wmRaw.marginX, wmDef.marginX, 0, 200, "水印水平边距", fail)),
-    marginY: Math.round(validateNumberField(wmRaw.marginY, wmDef.marginY, 0, 200, "水印垂直边距", fail)),
+    x,
+    y,
   };
 
   const muEnabled = muRaw.enabled === undefined ? muDef.enabled : muRaw.enabled;
@@ -245,11 +245,20 @@ function validateExportSettings(raw, { requireAssets = false } = {}) {
   const loop = muRaw.loop === undefined ? muDef.loop : muRaw.loop;
   if (typeof loop !== "boolean") fail("背景音乐循环开关必须是布尔值。");
 
+  const keepOriginalAudio =
+    muRaw.keepOriginalAudio === undefined
+      ? muDef.keepOriginalAudio
+      : muRaw.keepOriginalAudio;
+  if (typeof keepOriginalAudio !== "boolean") {
+    fail("保留原声选项必须是布尔值。");
+  }
+
   const music = {
     enabled: muEnabled,
     file,
     volume: validateNumberField(muRaw.volume, muDef.volume, 0, 1, "背景音乐音量", fail),
     loop,
+    keepOriginalAudio,
   };
 
   if (requireAssets) {
@@ -277,7 +286,6 @@ function watermarkConfigHash(watermark) {
       paddingX: watermark.paddingX,
       paddingY: watermark.paddingY,
       opacity: watermark.opacity,
-      position: watermark.position,
     }))
     .digest("hex");
 }
@@ -796,6 +804,7 @@ export async function createVideoServer(options = {}) {
                   file: activeMusic.file,
                   volume: activeMusic.volume,
                   loop: activeMusic.loop,
+                  keepOriginalAudio: activeMusic.keepOriginalAudio !== false,
                   dev: musicInfo.dev,
                   ino: musicInfo.ino,
                   size: musicInfo.size,
@@ -907,6 +916,7 @@ export async function createVideoServer(options = {}) {
                     handle: musicHandle,
                     volume: activeMusic.volume,
                     loop: activeMusic.loop,
+                    keepOriginalAudio: activeMusic.keepOriginalAudio !== false,
                   }
                 : null;
             }

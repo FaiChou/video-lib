@@ -90,15 +90,15 @@ function defaultExportSettings() {
       paddingX: 16,
       paddingY: 8,
       opacity: 1,
-      position: "bottom-right",
-      marginX: 24,
-      marginY: 24,
+      x: 0.92,
+      y: 0.92,
     },
     music: {
       enabled: false,
       file: "",
       volume: 0.35,
       loop: true,
+      keepOriginalAudio: true,
     },
   };
 }
@@ -116,12 +116,22 @@ const exportState = {
   loaded: false,
   saving: false,
   uploadingMusic: false,
-  previewVideoId: "",
   auditionName: "",
   loadError: "",
 };
 const auditionAudio = new Audio();
 let previewResizeObserver = null;
+let previewScrubbing = false;
+let previewBadgeRect = null;
+const wmDrag = {
+  active: false,
+  pointerId: null,
+  grabX: 0,
+  grabY: 0,
+  hovering: false,
+  snapX: false,
+  snapY: false,
+};
 let deleteTargets = [],
   deleting = false;
 const deletedChanges = new Map();
@@ -864,7 +874,7 @@ async function loadLibrary({ notify = false } = {}) {
     state.loaded = true;
     state.loadError = "";
     if (!state.users.some((u) => u.name === state.selected)) state.selected = "";
-    syncPreviewVideoOptions();
+    syncPreviewVideo();
     renderCurrentView();
     const playerToggle =
       $("playerProcessedControl").querySelector(".processed-toggle");
@@ -992,14 +1002,14 @@ function updateDownloadButton(control, video) {
   control.setAttribute("aria-busy", String(!!busy));
   control.setAttribute(
     "aria-label",
-    `${checking ? "正在检查下载格式" : busy ? "查看下载进度" : activeEffects ? "使用 Mediabunny 处理并下载 MP4" : "下载 H.264 MP4"}：${video.name}`,
+    `${checking ? "正在检查下载格式" : busy ? "查看下载进度" : activeEffects ? "处理并下载 MP4" : "下载 H.264 MP4"}：${video.name}`,
   );
   control.title = checking
     ? "正在检查下载格式"
     : busy
       ? "点击查看下载准备进度"
       : activeEffects
-        ? "点击后将使用 Mediabunny 添加水印/音乐并导出 MP4"
+        ? "点击后将添加水印/音乐并导出 MP4"
         : "下载 H.264 编码的 MP4";
   control.querySelector(".download-label").textContent = checking
     ? "检查中…"
@@ -1041,14 +1051,14 @@ function renderDownload(entry) {
         : "H.264 MP4 已准备好"
       : job?.status === "processing"
         ? effectsText
-          ? `正在使用 Mediabunny 添加${effectsText}并导出 MP4…`
+          ? "正在处理中…"
           : "正在检查编码并准备 H.264 MP4…"
         : job?.status === "queued"
           ? "正在排队，请稍候…"
           : "正在准备下载…";
   const progressTitle = $("downloadProgressGroup").querySelector(".progress-meta > span");
   if (progressTitle) {
-    progressTitle.textContent = effectsText ? `Mediabunny 处理中（${effectsText}）` : "准备 H.264 MP4";
+    progressTitle.textContent = effectsText ? "正在处理中" : "准备 H.264 MP4";
   }
   $("readyDownload").replaceChildren(
     icon("download"),
@@ -1623,6 +1633,14 @@ function stopExportMedia() {
     exportState.auditionName = "";
     renderMusicList();
   }
+  syncPreviewPlaybackUI();
+}
+function formatClock(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const total = Math.floor(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
 }
 function drawRoundedRectPath(ctx, x, y, w, h, r) {
   const radius = Math.max(0, Math.min(r, w / 2, h / 2));
@@ -1675,18 +1693,9 @@ function measureAndRenderWatermarkBadge(wm, scale) {
   iCtx.font = font;
   iCtx.fillStyle = wm.color;
   iCtx.textBaseline = "middle";
-  let align = "left";
-  let textX = padX;
-  if (wm.position.endsWith("-right")) {
-    align = "right";
-    textX = badgeW - padX;
-  } else if (wm.position.endsWith("-center") || wm.position === "center") {
-    align = "center";
-    textX = badgeW / 2;
-  }
-  iCtx.textAlign = align;
+  iCtx.textAlign = "center";
   for (let i = 0; i < lines.length; i++) {
-    iCtx.fillText(lines[i], textX, padY + (i + 0.5) * lineHeight);
+    iCtx.fillText(lines[i], badgeW / 2, padY + (i + 0.5) * lineHeight);
   }
   iCtx.restore();
 
@@ -1700,22 +1709,11 @@ function measureAndRenderWatermarkBadge(wm, scale) {
   return out;
 }
 function computePreviewWatermarkPlacement(wm, videoW, videoH, badgeW, badgeH) {
-  const scale = Math.min(videoW, videoH) / 720;
-  const marginX = Math.max(0, Math.round(wm.marginX * scale));
-  const marginY = Math.max(0, Math.round(wm.marginY * scale));
-  let x;
-  if (wm.position.endsWith("-left")) x = marginX;
-  else if (wm.position.endsWith("-right")) x = videoW - badgeW - marginX;
-  else x = Math.round((videoW - badgeW) / 2);
-
-  let y;
-  if (wm.position.startsWith("top-")) y = marginY;
-  else if (wm.position.startsWith("bottom-")) y = videoH - badgeH - marginY;
-  else y = Math.round((videoH - badgeH) / 2);
-
+  const rx = Math.max(0, Math.min(1, Number(wm.x) || 0));
+  const ry = Math.max(0, Math.min(1, Number(wm.y) || 0));
   return {
-    x: Math.max(0, Math.min(Math.max(0, videoW - badgeW), x)),
-    y: Math.max(0, Math.min(Math.max(0, videoH - badgeH), y)),
+    x: Math.round(rx * Math.max(0, videoW - badgeW)),
+    y: Math.round(ry * Math.max(0, videoH - badgeH)),
   };
 }
 function exportWatermarkOverlayPng(wm) {
@@ -1777,31 +1775,99 @@ function drawPreviewWatermark() {
   ctx.clearRect(0, 0, pxW, pxH);
 
   const wm = exportState.draft.watermark;
-  if (!wm.enabled || !wm.text.trim()) return;
+  const draggable = Boolean(wm.enabled && wm.text.trim());
+  $("previewDragHint").hidden = !draggable;
+  canvas.classList.toggle("is-draggable", draggable);
+  if (!draggable) {
+    previewBadgeRect = null;
+    canvas.classList.remove("is-hovering", "is-dragging");
+    return;
+  }
 
   const scale = Math.min(pxW, pxH) / 720;
-  const marginX = Math.max(0, Math.round(wm.marginX * scale));
-  const marginY = Math.max(0, Math.round(wm.marginY * scale));
-  const maxW = Math.max(1, pxW - marginX * 2);
-  const maxH = Math.max(1, pxH - marginY * 2);
   const badge = measureAndRenderWatermarkBadge(wm, scale);
-  const fit = Math.min(1, maxW / badge.width, maxH / badge.height);
+  const fit = Math.min(1, pxW / badge.width, pxH / badge.height);
   const drawW = Math.max(1, Math.round(badge.width * fit));
   const drawH = Math.max(1, Math.round(badge.height * fit));
   const { x, y } = computePreviewWatermarkPlacement(wm, pxW, pxH, drawW, drawH);
+
+  previewBadgeRect = {
+    x: x / dpr,
+    y: y / dpr,
+    w: drawW / dpr,
+    h: drawH / dpr,
+    canvasW: dispW,
+    canvasH: dispH,
+  };
+
+  if (wmDrag.active && (wmDrag.snapX || wmDrag.snapY)) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.65)";
+    ctx.lineWidth = Math.max(1, dpr);
+    ctx.setLineDash([4 * dpr, 4 * dpr]);
+    if (wmDrag.snapX) {
+      ctx.beginPath();
+      ctx.moveTo(pxW / 2, 0);
+      ctx.lineTo(pxW / 2, pxH);
+      ctx.stroke();
+    }
+    if (wmDrag.snapY) {
+      ctx.beginPath();
+      ctx.moveTo(0, pxH / 2);
+      ctx.lineTo(pxW, pxH / 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   ctx.drawImage(badge, x, y, drawW, drawH);
+
+  if (wmDrag.hovering || wmDrag.active) {
+    ctx.save();
+    ctx.strokeStyle = wmDrag.active
+      ? "rgba(247, 104, 138, 0.95)"
+      : "rgba(255, 255, 255, 0.85)";
+    ctx.lineWidth = Math.max(1.5, 1.5 * dpr);
+    ctx.setLineDash([4 * dpr, 3 * dpr]);
+    ctx.strokeRect(
+      Math.max(0.5, x - 2),
+      Math.max(0.5, y - 2),
+      Math.min(pxW - 1, drawW + 4),
+      Math.min(pxH - 1, drawH + 4),
+    );
+    ctx.restore();
+  }
 }
-function syncPreviewVideoOptions() {
-  const select = $("previewVideoSelect");
+function syncPreviewPlaybackUI() {
+  const videoEl = $("previewVideo");
+  const playBtn = $("previewPlayToggle");
+  const seek = $("previewSeek");
+  const timeEl = $("previewTime");
+  const hasVideo = state.videos.length > 0 && !videoEl.hidden;
+  const playing = hasVideo && !videoEl.paused && !videoEl.ended;
+
+  playBtn.disabled = !hasVideo;
+  playBtn.replaceChildren(icon(playing ? "pause" : "play"));
+  playBtn.setAttribute("aria-label", playing ? "暂停预览" : "播放预览");
+  playBtn.title = playing ? "暂停" : "播放";
+
+  const dur = Number.isFinite(videoEl.duration) && videoEl.duration > 0 ? videoEl.duration : 0;
+  const cur = Number.isFinite(videoEl.currentTime) ? videoEl.currentTime : 0;
+  const timeText = `${formatClock(cur)} / ${formatClock(dur)}`;
+  timeEl.textContent = timeText;
+
+  seek.disabled = !hasVideo || !dur;
+  if (!previewScrubbing) {
+    seek.value = dur > 0 ? String(Math.round((cur / dur) * 1000)) : "0";
+    syncRangeSlider(seek, timeText);
+  }
+}
+function syncPreviewVideo() {
   const videoEl = $("previewVideo");
   const emptyEl = $("previewEmpty");
+  const active = state.videos[0] || null;
 
-  if (!state.videos.length) {
-    exportState.previewVideoId = "";
-    const opt = el("option", "", "暂无示例视频");
-    opt.value = "";
-    select.replaceChildren(opt);
-    select.disabled = true;
+  if (!active) {
     videoEl.hidden = true;
     if (videoEl.hasAttribute("src")) {
       videoEl.pause();
@@ -1810,35 +1876,13 @@ function syncPreviewVideoOptions() {
     }
     emptyEl.hidden = false;
     $("previewVideoMeta").textContent = "视频库暂无视频（仍可预览水印效果）";
+    syncPreviewPlaybackUI();
     drawPreviewWatermark();
     return;
   }
 
-  select.disabled = false;
   emptyEl.hidden = true;
   videoEl.hidden = false;
-  select.replaceChildren(
-    ...state.videos.map((v, index) => {
-      const opt = el(
-        "option",
-        "",
-        `${index === 0 ? "[默认第一个] " : ""}${v.user} / ${v.name}`,
-      );
-      opt.value = v.id;
-      return opt;
-    }),
-  );
-
-  if (
-    !exportState.previewVideoId ||
-    !state.videos.some((v) => v.id === exportState.previewVideoId)
-  ) {
-    exportState.previewVideoId = state.videos[0].id;
-  }
-  select.value = exportState.previewVideoId;
-  const active =
-    state.videos.find((v) => v.id === exportState.previewVideoId) ||
-    state.videos[0];
   if (videoEl.getAttribute("src") !== active.url) {
     videoEl.src = active.url;
   }
@@ -1846,13 +1890,15 @@ function syncPreviewVideoOptions() {
     videoEl.videoWidth > 0
       ? ` · ${videoEl.videoWidth}×${videoEl.videoHeight}`
       : "";
-  $("previewVideoMeta").textContent =
-    `${active.user} / ${active.name}${resText}`;
+  $("previewVideoMeta").textContent = `${active.user} / ${active.name}${resText}`;
+  syncPreviewPlaybackUI();
 }
 function syncPreviewAudioSource() {
+  const videoEl = $("previewVideo");
   const audioEl = $("previewAudio");
   const mu = exportState.draft.music;
   const track = exportState.music.find((item) => item.name === mu.file);
+  videoEl.muted = Boolean(mu.enabled && mu.keepOriginalAudio === false);
   audioEl.volume = Math.max(0, Math.min(1, mu.volume));
   audioEl.loop = Boolean(mu.loop);
   if (!mu.enabled || !track) {
@@ -1905,8 +1951,11 @@ function renderPreviewSummary() {
   const parts = [];
   if (wm.enabled && wm.text.trim()) parts.push("文字水印");
   else if (wm.enabled) parts.push("水印已开启（未填内容）");
-  if (mu.enabled && mu.file) parts.push(`背景音乐（${mu.file}）`);
-  else if (mu.enabled) parts.push("音乐已开启（未选文件）");
+  if (mu.enabled && mu.file) {
+    parts.push(`背景音乐（${mu.file}${mu.keepOriginalAudio === false ? " · 静音原声" : ""}）`);
+  } else if (mu.enabled) {
+    parts.push("音乐已开启（未选文件）");
+  }
   $("previewEffectsSummary").textContent = parts.length
     ? `预览效果：${parts.join(" + ")}`
     : "当前未开启水印和音乐（直接下载原格式）";
@@ -2167,23 +2216,6 @@ function renderExportControls() {
   $("wmOpacityValue").textContent = `${opacityPct}%`;
   syncRangeSlider($("wmOpacity"), `${opacityPct}%`);
 
-  $("wmPositionGrid")
-    .querySelectorAll("button")
-    .forEach((btn) => {
-      btn.setAttribute(
-        "aria-pressed",
-        String(btn.dataset.position === wm.position),
-      );
-    });
-
-  $("wmMarginX").value = String(wm.marginX);
-  $("wmMarginXValue").textContent = `${wm.marginX} px`;
-  syncRangeSlider($("wmMarginX"), `${wm.marginX} px`);
-
-  $("wmMarginY").value = String(wm.marginY);
-  $("wmMarginYValue").textContent = `${wm.marginY} px`;
-  syncRangeSlider($("wmMarginY"), `${wm.marginY} px`);
-
   $("wmPaddingX").value = String(wm.paddingX);
   $("wmPaddingXValue").textContent = `${wm.paddingX} px`;
   syncRangeSlider($("wmPaddingX"), `${wm.paddingX} px`);
@@ -2204,6 +2236,13 @@ function renderExportControls() {
   $("musicVolumeValue").textContent = `${volPct}%`;
   syncRangeSlider($("musicVolume"), `${volPct}%`);
 
+  const keepOrig = mu.keepOriginalAudio !== false;
+  setSwitchState(
+    $("musicKeepOriginal"),
+    keepOrig,
+    keepOrig ? "保留原声" : "静音原声",
+  );
+
   setSwitchState($("musicLoop"), mu.loop, mu.loop ? "开启循环" : "单次播放");
 }
 function renderExportPage() {
@@ -2214,7 +2253,7 @@ function renderExportPage() {
   } else {
     $("exportError").hidden = true;
   }
-  syncPreviewVideoOptions();
+  syncPreviewVideo();
   renderExportControls();
   renderMusicList();
   syncPreviewAudioSource();
@@ -2375,23 +2414,66 @@ $("deleteDialog").addEventListener("close", () => { deleteTargets = []; });
 closeOnBackdrop($("deleteDialog"), closeDelete);
 
 // Export settings page events
-$("previewVideoSelect").addEventListener("change", () => {
-  exportState.previewVideoId = $("previewVideoSelect").value;
-  syncPreviewVideoOptions();
-  drawPreviewWatermark();
+$("previewPlayToggle").addEventListener("click", () => {
+  const videoEl = $("previewVideo");
+  if (!state.videos.length || videoEl.hidden) return;
+  if (videoEl.paused || videoEl.ended) {
+    videoEl.play().catch(() => {});
+  } else {
+    videoEl.pause();
+  }
+});
+$("previewSeek").addEventListener("pointerdown", () => {
+  previewScrubbing = true;
+});
+for (const ev of ["pointerup", "pointercancel"]) {
+  $("previewSeek").addEventListener(ev, () => {
+    previewScrubbing = false;
+  });
+}
+$("previewSeek").addEventListener("input", () => {
+  const videoEl = $("previewVideo");
+  const dur = Number.isFinite(videoEl.duration) ? videoEl.duration : 0;
+  if (!dur) return;
+  const target = (Number($("previewSeek").value) / 1000) * dur;
+  videoEl.currentTime = target;
+  const timeText = `${formatClock(target)} / ${formatClock(dur)}`;
+  $("previewTime").textContent = timeText;
+  syncRangeSlider($("previewSeek"), timeText);
+  syncPreviewAudioPlayback();
+});
+$("previewSeek").addEventListener("change", () => {
+  previewScrubbing = false;
+  syncPreviewPlaybackUI();
 });
 $("previewVideo").addEventListener("loadedmetadata", () => {
-  const active = state.videos.find((v) => v.id === exportState.previewVideoId);
+  const active = state.videos[0];
   if (active && $("previewVideo").videoWidth > 0) {
     $("previewVideoMeta").textContent =
       `${active.user} / ${active.name} · ${$("previewVideo").videoWidth}×${$("previewVideo").videoHeight}`;
   }
+  syncPreviewPlaybackUI();
   drawPreviewWatermark();
 });
-$("previewVideo").addEventListener("play", syncPreviewAudioPlayback);
-$("previewVideo").addEventListener("pause", () => $("previewAudio").pause());
-$("previewVideo").addEventListener("ended", () => $("previewAudio").pause());
-$("previewVideo").addEventListener("seeked", syncPreviewAudioPlayback);
+for (const ev of ["timeupdate", "durationchange"]) {
+  $("previewVideo").addEventListener(ev, syncPreviewPlaybackUI);
+}
+$("previewVideo").addEventListener("play", () => {
+  syncPreviewPlaybackUI();
+  syncPreviewAudioPlayback();
+});
+$("previewVideo").addEventListener("pause", () => {
+  syncPreviewPlaybackUI();
+  $("previewAudio").pause();
+});
+$("previewVideo").addEventListener("ended", () => {
+  syncPreviewPlaybackUI();
+  $("previewAudio").pause();
+});
+$("previewVideo").addEventListener("seeked", () => {
+  syncPreviewPlaybackUI();
+  syncPreviewAudioPlayback();
+});
 auditionAudio.addEventListener("ended", () => {
   exportState.auditionName = "";
   renderMusicList();
@@ -2402,6 +2484,108 @@ if (typeof ResizeObserver === "function") {
   });
   previewResizeObserver.observe($("previewStage"));
 }
+
+function hitTestPreviewBadge(ptX, ptY, padding = 0) {
+  if (!previewBadgeRect) return false;
+  return (
+    ptX >= previewBadgeRect.x - padding &&
+    ptX <= previewBadgeRect.x + previewBadgeRect.w + padding &&
+    ptY >= previewBadgeRect.y - padding &&
+    ptY <= previewBadgeRect.y + previewBadgeRect.h + padding
+  );
+}
+function canvasCssPoint(event) {
+  const rect = $("previewCanvas").getBoundingClientRect();
+  return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+}
+$("previewCanvas").addEventListener("pointerdown", (e) => {
+  const wm = exportState.draft.watermark;
+  if (!wm.enabled || !wm.text.trim() || !previewBadgeRect) return;
+  const pt = canvasCssPoint(e);
+  if (!hitTestPreviewBadge(pt.x, pt.y, 8)) return;
+  e.preventDefault();
+  wmDrag.active = true;
+  wmDrag.pointerId = e.pointerId;
+  wmDrag.grabX = Math.max(0, Math.min(previewBadgeRect.w, pt.x - previewBadgeRect.x));
+  wmDrag.grabY = Math.max(0, Math.min(previewBadgeRect.h, pt.y - previewBadgeRect.y));
+  wmDrag.snapX = false;
+  wmDrag.snapY = false;
+  $("previewCanvas").classList.add("is-dragging");
+  $("previewCanvas").setPointerCapture?.(e.pointerId);
+  drawPreviewWatermark();
+});
+$("previewCanvas").addEventListener("pointermove", (e) => {
+  const wm = exportState.draft.watermark;
+  if (!wm.enabled || !wm.text.trim() || !previewBadgeRect) return;
+  const pt = canvasCssPoint(e);
+  if (!wmDrag.active) {
+    const hover = hitTestPreviewBadge(pt.x, pt.y, 4);
+    if (hover !== wmDrag.hovering) {
+      wmDrag.hovering = hover;
+      $("previewCanvas").classList.toggle("is-hovering", hover);
+      drawPreviewWatermark();
+    }
+    return;
+  }
+  if (e.pointerId !== wmDrag.pointerId) return;
+  const maxLeft = Math.max(0, previewBadgeRect.canvasW - previewBadgeRect.w);
+  const maxTop = Math.max(0, previewBadgeRect.canvasH - previewBadgeRect.h);
+  let left = Math.max(0, Math.min(maxLeft, pt.x - wmDrag.grabX));
+  let top = Math.max(0, Math.min(maxTop, pt.y - wmDrag.grabY));
+  const centerLeft = maxLeft / 2;
+  const centerTop = maxTop / 2;
+  wmDrag.snapX = maxLeft > 0 && Math.abs(left - centerLeft) <= 5;
+  wmDrag.snapY = maxTop > 0 && Math.abs(top - centerTop) <= 5;
+  if (wmDrag.snapX) left = centerLeft;
+  if (wmDrag.snapY) top = centerTop;
+
+  wm.x = maxLeft > 0 ? Math.round((left / maxLeft) * 10000) / 10000 : 0.5;
+  wm.y = maxTop > 0 ? Math.round((top / maxTop) * 10000) / 10000 : 0.5;
+  drawPreviewWatermark();
+  renderExportStatus();
+});
+function endWatermarkDrag(e) {
+  if (!wmDrag.active) return;
+  if (e && wmDrag.pointerId !== null && e.pointerId !== wmDrag.pointerId) return;
+  wmDrag.active = false;
+  wmDrag.snapX = false;
+  wmDrag.snapY = false;
+  if (wmDrag.pointerId !== null) {
+    try {
+      if ($("previewCanvas").hasPointerCapture?.(wmDrag.pointerId)) {
+        $("previewCanvas").releasePointerCapture(wmDrag.pointerId);
+      }
+    } catch {}
+  }
+  wmDrag.pointerId = null;
+  $("previewCanvas").classList.remove("is-dragging");
+  drawPreviewWatermark();
+}
+$("previewCanvas").addEventListener("pointerup", endWatermarkDrag);
+$("previewCanvas").addEventListener("pointercancel", endWatermarkDrag);
+$("previewCanvas").addEventListener("pointerleave", () => {
+  if (!wmDrag.active && wmDrag.hovering) {
+    wmDrag.hovering = false;
+    $("previewCanvas").classList.remove("is-hovering");
+    drawPreviewWatermark();
+  }
+});
+$("previewCanvas").addEventListener("keydown", (e) => {
+  const wm = exportState.draft.watermark;
+  if (!wm.enabled || !wm.text.trim()) return;
+  const step = e.shiftKey ? 0.005 : 0.02;
+  let handled = true;
+  if (e.key === "ArrowLeft") wm.x = Math.max(0, Math.round((wm.x - step) * 10000) / 10000);
+  else if (e.key === "ArrowRight") wm.x = Math.min(1, Math.round((wm.x + step) * 10000) / 10000);
+  else if (e.key === "ArrowUp") wm.y = Math.max(0, Math.round((wm.y - step) * 10000) / 10000);
+  else if (e.key === "ArrowDown") wm.y = Math.min(1, Math.round((wm.y + step) * 10000) / 10000);
+  else handled = false;
+  if (handled) {
+    e.preventDefault();
+    drawPreviewWatermark();
+    renderExportStatus();
+  }
+});
 
 $("wmEnabled").addEventListener("click", () => {
   exportState.draft.watermark.enabled = !exportState.draft.watermark.enabled;
@@ -2437,8 +2621,6 @@ for (const [id, field, scale, unit] of [
   ["wmBgOpacity", "backgroundOpacity", 0.01, "%"],
   ["wmBorderRadius", "borderRadius", 1, " px"],
   ["wmOpacity", "opacity", 0.01, "%"],
-  ["wmMarginX", "marginX", 1, " px"],
-  ["wmMarginY", "marginY", 1, " px"],
   ["wmPaddingX", "paddingX", 1, " px"],
   ["wmPaddingY", "paddingY", 1, " px"],
 ]) {
@@ -2452,14 +2634,6 @@ for (const [id, field, scale, unit] of [
     renderExportStatus();
   });
 }
-$("wmPositionGrid").addEventListener("click", (e) => {
-  const btn = e.target.closest("button[data-position]");
-  if (!btn || $("wmFields").disabled) return;
-  exportState.draft.watermark.position = btn.dataset.position;
-  renderExportControls();
-  drawPreviewWatermark();
-  renderExportStatus();
-});
 
 $("musicEnabled").addEventListener("click", () => {
   exportState.draft.music.enabled = !exportState.draft.music.enabled;
@@ -2476,6 +2650,13 @@ $("musicVolume").addEventListener("input", () => {
   syncRangeSlider($("musicVolume"), text);
   $("previewAudio").volume = exportState.draft.music.volume;
   if (!auditionAudio.paused) auditionAudio.volume = exportState.draft.music.volume;
+  renderExportStatus();
+});
+$("musicKeepOriginal").addEventListener("click", () => {
+  exportState.draft.music.keepOriginalAudio =
+    exportState.draft.music.keepOriginalAudio === false;
+  renderExportControls();
+  syncPreviewAudioSource();
   renderExportStatus();
 });
 $("musicLoop").addEventListener("click", () => {
