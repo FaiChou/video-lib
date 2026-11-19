@@ -90,6 +90,10 @@ let activeDownload = null,
   downloadDialogGeneration = 0,
   autoStartDownload = false;
 let processedRevision = 0;
+let filterScrollObserver = null;
+let lastRenderedFilterUser = null;
+let shouldRevealFilterChip = false;
+const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
 const palette = [
   ["#f0e8f7", "#9e7cb7"],
   ["#e5f0eb", "#719e87"],
@@ -158,20 +162,78 @@ function renderGridLayout() {
       );
     });
 }
+function usesFallbackFilterFades() {
+  return (
+    !CSS.supports("animation-timeline", "scroll()") ||
+    reducedMotionQuery.matches
+  );
+}
+function syncFilterScrollHints() {
+  filterScrollObserver?.disconnect();
+  filterScrollObserver = null;
+  const scroller = $("userFilters");
+  scroller.classList.remove("more-start", "more-end");
+  if (
+    !usesFallbackFilterFades() ||
+    scroller.hidden ||
+    !scroller.firstElementChild
+  )
+    return;
+  const first = scroller.firstElementChild;
+  const last = scroller.lastElementChild;
+  filterScrollObserver = new IntersectionObserver(
+    (entries) => {
+      for (const { target, intersectionRatio } of entries) {
+        if (target === first)
+          scroller.classList.toggle("more-start", intersectionRatio < 1);
+        if (target === last)
+          scroller.classList.toggle("more-end", intersectionRatio < 1);
+      }
+    },
+    { root: scroller, threshold: 1, rootMargin: "1px" },
+  );
+  filterScrollObserver.observe(first);
+  if (last !== first) filterScrollObserver.observe(last);
+}
+reducedMotionQuery.addEventListener("change", syncFilterScrollHints);
+function revealFilterChip(chip, smooth = true) {
+  const scroller = $("userFilters");
+  if (!chip || scroller.hidden || scroller.scrollWidth <= scroller.clientWidth)
+    return;
+  const scrollerRect = scroller.getBoundingClientRect();
+  const chipRect = chip.getBoundingClientRect();
+  const pad = 28;
+  let delta = 0;
+  if (chipRect.left < scrollerRect.left + pad)
+    delta = chipRect.left - (scrollerRect.left + pad);
+  else if (chipRect.right > scrollerRect.right - pad)
+    delta = chipRect.right - (scrollerRect.right - pad);
+  if (delta) {
+    scroller.scrollBy({
+      left: delta,
+      behavior: smooth && !reducedMotionQuery.matches ? "smooth" : "auto",
+    });
+  }
+}
 function renderFilters() {
+  const scroller = $("userFilters");
+  const activeInFilters = scroller.contains(document.activeElement);
   const all = button("全部用户", "filter-chip", () => {
     state.selected = "";
     state.page = 1;
+    shouldRevealFilterChip = true;
     renderLibrary();
   });
   all.setAttribute("aria-pressed", String(!state.selected));
   all.append(el("span", "filter-count", String(state.videos.length)));
+  let activeChip = !state.selected ? all : null;
   const fragment = document.createDocumentFragment();
   fragment.append(all);
   for (const user of state.users) {
     const b = button("", "filter-chip", () => {
       state.selected = user.name;
       state.page = 1;
+      shouldRevealFilterChip = true;
       renderLibrary();
     });
     b.append(
@@ -179,10 +241,22 @@ function renderFilters() {
       document.createTextNode(user.name),
       el("span", "filter-count", String(user.count)),
     );
-    b.setAttribute("aria-pressed", String(state.selected === user.name));
+    const pressed = state.selected === user.name;
+    b.setAttribute("aria-pressed", String(pressed));
+    if (pressed) activeChip = b;
     fragment.append(b);
   }
-  $("userFilters").replaceChildren(fragment);
+  scroller.replaceChildren(fragment);
+  syncFilterScrollHints();
+  if (activeInFilters && activeChip) activeChip.focus({ preventScroll: true });
+  if (
+    activeChip &&
+    (shouldRevealFilterChip || lastRenderedFilterUser !== state.selected)
+  ) {
+    revealFilterChip(activeChip, lastRenderedFilterUser !== null);
+  }
+  lastRenderedFilterUser = state.selected;
+  shouldRevealFilterChip = false;
 }
 function filteredVideos() {
   return state.videos
@@ -450,9 +524,6 @@ function renderLibrary() {
   const pages = Math.max(1, Math.ceil(videos.length / state.pageSize));
   state.page = Math.min(Math.max(1, Math.floor(state.page)), pages);
   const start = (state.page - 1) * state.pageSize;
-  $("totalCount").textContent = String(state.videos.length);
-  $("collectionTitle").textContent =
-    state.selected || state.hideProcessed ? "筛选片刻" : "全部片刻";
   $("resultSummary").textContent = videos.length
     ? `共 ${videos.length} 个视频 · 正在展示 ${start + 1}–${Math.min(start + state.pageSize, videos.length)} 个`
     : "共 0 个视频";
@@ -491,7 +562,6 @@ function renderManagement() {
   for (const id of management.selected) {
     if (!existing.has(id)) management.selected.delete(id);
   }
-  $("manageCount").textContent = String(state.videos.length);
   const allUsers = el("option", "", "全部分组");
   allUsers.value = "";
   $("manageUser").replaceChildren(allUsers, ...state.users.map((user) => {
@@ -773,16 +843,20 @@ function route() {
   const manage =
     location.hash === "#manage" ||
     (!location.hash && /^\/manage\/?$/.test(location.pathname));
+  const isLibrary = !upload && !manage;
   state.view = upload ? "upload" : manage ? "manage" : "library";
-  $("libraryView").hidden = upload || manage;
+  $("userFilters").hidden = !isLibrary;
+  $("headerBack").hidden = isLibrary;
+  $("libraryView").hidden = !isLibrary;
   $("uploadView").hidden = !upload;
   $("manageView").hidden = !manage;
   if (manage) $("manageLink").setAttribute("aria-current", "page");
   else $("manageLink").removeAttribute("aria-current");
-  if (upload || manage) {
+  if (!isLibrary) {
     clearThumbs();
     $("videoGrid").replaceChildren();
   }
+  syncFilterScrollHints();
   if (state.loaded || state.loadError) renderCurrentView();
   document.title = upload ? "上传视频 · 片刻" : manage ? "管理视频 · 片刻" : "片刻 · 视频收藏";
 }

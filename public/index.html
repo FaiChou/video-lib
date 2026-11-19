@@ -16,8 +16,14 @@
   <body>
     <header class="site-header">
       <nav class="header-inner" aria-label="主导航">
-        <a href="#library" class="brand" aria-label="回到视频库" title="视频库">
-          <span class="brand-icon" aria-hidden="true">▶</span>
+        <div
+          id="userFilters"
+          class="user-filters"
+          role="group"
+          aria-label="按用户名筛选"
+        ></div>
+        <a id="headerBack" class="header-back" href="#library" hidden>
+          <span data-icon="arrowLeft"></span>返回视频库
         </a>
         <div class="header-actions">
           <button class="button primary" id="quickUpload">
@@ -31,21 +37,7 @@
     </header>
     <main class="shell">
       <section id="libraryView">
-        <section class="collection" aria-labelledby="collectionTitle">
-          <div class="section-heading">
-            <div class="title-line">
-              <h2 id="collectionTitle">全部片刻</h2>
-              <span id="totalCount" class="count-pill">0</span>
-            </div>
-          </div>
-          <div class="filter-row">
-            <div
-              id="userFilters"
-              class="user-filters"
-              role="group"
-              aria-label="按用户名筛选"
-            ></div>
-          </div>
+        <section class="collection" aria-label="视频列表">
           <div class="toolbar">
             <label class="search-box"
               ><span data-icon="search"></span
@@ -118,15 +110,7 @@
           </div>
         </section>
       </section>
-      <section id="manageView" class="manage-view" hidden aria-labelledby="manageTitle">
-        <a class="back-link" href="#library"><span data-icon="arrowLeft"></span>返回视频库</a>
-        <div class="section-heading">
-          <div class="title-line">
-            <h1 id="manageTitle">管理视频</h1>
-            <span id="manageCount" class="count-pill">0</span>
-          </div>
-        </div>
-        <p class="manage-description">查看视频信息，删除不再需要的视频。</p>
+      <section id="manageView" class="manage-view" hidden aria-label="管理视频">
         <div class="toolbar management-toolbar">
           <label class="search-box"><span data-icon="search"></span><input id="manageSearch" type="search" placeholder="搜索视频名称…" aria-label="搜索管理列表" /></label>
           <div class="toolbar-actions">
@@ -173,9 +157,6 @@
         hidden
         aria-labelledby="uploadTitle"
       >
-        <a class="back-link" href="#library"
-          ><span data-icon="arrowLeft"></span>返回视频库</a
-        >
         <div class="upload-intro">
           <span class="eyebrow">MAKE ROOM FOR MORE MOMENTS</span>
           <h1 id="uploadTitle">新的片刻，<span>从这里开始。</span></h1>
