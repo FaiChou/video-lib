@@ -9,15 +9,26 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   ALL_FORMATS,
+  AudioSample,
   AudioSampleSink,
+  AudioSampleSource,
   Conversion,
   EncodedPacketSink,
   FilePathSource,
+  FilePathTarget,
   Input,
   MP4,
+  Mp3OutputFormat,
+  Output,
   VideoSampleSink,
 } from "mediabunny";
-import { isCompatibleVideo, normalizeVideo } from "../media-converter.mjs";
+import { deflateSync } from "node:zlib";
+import {
+  isCompatibleVideo,
+  isValidMp3,
+  normalizeVideo,
+  validateOverlayPng,
+} from "../media-converter.mjs";
 
 // These 0.5-second fixtures are synthetic test patterns and a 440 Hz tone.
 // Tests exercise actual codecs; ffmpeg is not needed to run this suite.
@@ -304,4 +315,282 @@ test("cancellation before and during probing keeps input handles open", async (t
     assert.ok((await options.handle.stat()).size > 0);
     await assert.rejects(stat(options.outputPath), { code: "ENOENT" });
   }
+});
+
+async function createTestMp3(filePath, durationSec = 0.25, freq = 660) {
+  const output = new Output({
+    format: new Mp3OutputFormat(),
+    target: new FilePathTarget(filePath),
+  });
+  const source = new AudioSampleSource({ codec: "mp3", bitrate: 128000 });
+  output.addAudioTrack(source);
+  await output.start();
+  const sampleRate = 44100;
+  const totalFrames = Math.max(1152, Math.round(sampleRate * durationSec));
+  const data = new Float32Array(totalFrames * 2);
+  for (let i = 0; i < totalFrames; i++) {
+    const val = 0.4 * Math.sin((2 * Math.PI * freq * i) / sampleRate);
+    data[i] = val;
+    data[totalFrames + i] = val;
+  }
+  const sample = new AudioSample({
+    format: "f32-planar",
+    sampleRate,
+    numberOfChannels: 2,
+    timestamp: 0,
+    data,
+  });
+  await source.add(sample);
+  sample.close();
+  source.close();
+  await output.finalize();
+}
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (const byte of buf) {
+    c ^= byte;
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const typeBuf = Buffer.from(type, "ascii");
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
+}
+
+function createSolidPng(width, height, r, g, b, a = 255) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // RGBA
+  const rowBytes = 1 + width * 4;
+  const raw = Buffer.alloc(rowBytes * height);
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * rowBytes;
+    raw[rowStart] = 0;
+    for (let x = 0; x < width; x++) {
+      const px = rowStart + 1 + x * 4;
+      raw[px] = r;
+      raw[px + 1] = g;
+      raw[px + 2] = b;
+      raw[px + 3] = a;
+    }
+  }
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", deflateSync(raw)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+async function readFrameRgba(filePath, timestamp = 0) {
+  const input = new Input({ formats: [MP4], source: new FilePathSource(filePath) });
+  try {
+    const track = await input.getPrimaryVideoTrack();
+    const sink = new VideoSampleSink(track, { hardwareAcceleration: "prefer-software" });
+    const sample = await sink.getSample(timestamp);
+    assert.ok(sample);
+    try {
+      const rgba = Buffer.alloc(sample.allocationSize({ format: "RGBA" }));
+      await sample.copyTo(rgba, { format: "RGBA" });
+      return { width: sample.displayWidth, height: sample.displayHeight, rgba };
+    } finally {
+      sample.close();
+    }
+  } finally {
+    input.dispose();
+  }
+}
+
+test("isValidMp3 validates real MP3 files and rejects invalid data without closing handles", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mp3-probe-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const mp3Path = path.join(dir, "tone.mp3");
+  await createTestMp3(mp3Path, 0.25);
+  const handle = await open(mp3Path, "r");
+  try {
+    const meta = await isValidMp3({ handle });
+    assert.ok(meta.duration > 0.15);
+    assert.equal(meta.numberOfChannels, 2);
+    assert.equal(meta.sampleRate, 44100);
+    assert.ok((await handle.stat()).size > 0);
+  } finally {
+    await handle.close();
+  }
+
+  const badPath = path.join(dir, "bad.mp3");
+  await writeFile(badPath, "not an mp3");
+  const badHandle = await open(badPath, "r");
+  try {
+    await assert.rejects(isValidMp3({ handle: badHandle }), /无效的 MP3/);
+  } finally {
+    await badHandle.close();
+  }
+});
+
+test("normalizeVideo applies server text watermark and PNG overlay onto H.264 MP4", async (t) => {
+  // 1. Server-rendered text watermark fallback (no overlay PNG)
+  const opts = await fixture(t, "h264-aac.mp4");
+  const before = await readFrameRgba(opts.inputPath, 0);
+  const wmResult = await normalizeVideo({
+    ...opts,
+    watermark: {
+      enabled: true,
+      text: "DEMO",
+      color: "#ffffff",
+      bold: true,
+      backgroundColor: "#ff0000",
+      backgroundOpacity: 0.9,
+      borderRadius: 6,
+      fontSize: 48,
+      paddingX: 20,
+      paddingY: 12,
+      opacity: 1,
+      position: "top-left",
+      marginX: 16,
+      marginY: 16,
+    },
+  });
+  assert.deepEqual(wmResult, { converted: true });
+  await assertMedia(t, opts.outputPath, { width: 64, height: 48, audio: true });
+  const after = await readFrameRgba(opts.outputPath, 0);
+  let changed = 0;
+  for (let i = 0; i < before.rgba.length; i += 4) {
+    if (
+      Math.abs(before.rgba[i] - after.rgba[i]) +
+        Math.abs(before.rgba[i + 1] - after.rgba[i + 1]) +
+        Math.abs(before.rgba[i + 2] - after.rgba[i + 2]) >
+      25
+    ) {
+      changed++;
+    }
+  }
+  assert.ok(changed > 10, "expected watermark to modify visible video pixels");
+
+  // 2. High-DPI browser PNG overlay path
+  const pngOpts = await fixture(t, "vp9-silent-odd.webm");
+  const redPng = createSolidPng(180, 90, 255, 0, 0, 220);
+  const pngMeta = await validateOverlayPng(redPng);
+  assert.deepEqual(pngMeta, { width: 180, height: 90 });
+  const pngResult = await normalizeVideo({
+    ...pngOpts,
+    watermark: {
+      enabled: true,
+      text: "PNG",
+      position: "top-left",
+      marginX: 30,
+      marginY: 30,
+    },
+    watermarkOverlay: redPng,
+    watermarkOverlayScale: 1,
+  });
+  assert.deepEqual(pngResult, { converted: true });
+  await assertMedia(t, pngOpts.outputPath, { width: 66, height: 50, audio: false });
+  const overlaid = await readFrameRgba(pngOpts.outputPath, 0);
+  // Check pixel near top-left margin (scale = 50 / 720 ~ 0.07 -> margin ~ 2, badge ~ 12x6)
+  const off = (4 * overlaid.width + 6) * 4;
+  assert.ok(overlaid.rgba[off] > 170 && overlaid.rgba[off + 2] < 80, "expected red PNG overlay near top-left");
+});
+
+test("normalizeVideo mixes looping MP3 background music into both audio and silent videos and combined watermark+music", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "bgm-test-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const mp3Path = path.join(dir, "bgm.mp3");
+  await createTestMp3(mp3Path, 0.2, 880);
+  const musicHandle = await open(mp3Path, "r");
+  t.after(() => musicHandle.close());
+
+  // Silent VP9 gains a stereo AAC audio track from looping MP3
+  const silentOpts = await fixture(t, "vp9-silent-odd.webm");
+  const silentRes = await normalizeVideo({
+    ...silentOpts,
+    music: { handle: musicHandle, volume: 0.6, loop: true },
+  });
+  assert.deepEqual(silentRes, { converted: true });
+  await assertMedia(t, silentOpts.outputPath, { width: 66, height: 50, audio: true });
+  const silentCheck = inspect(t, silentOpts.outputPath);
+  const silentAudio = await silentCheck.getPrimaryAudioTrack();
+  // Verify audio around 0.35s (beyond 0.2s MP3 length) is non-silent due to looping
+  const lateSample = await new AudioSampleSink(silentAudio).getSample(0.35);
+  assert.ok(lateSample);
+  const lateF32 = new Float32Array(lateSample.allocationSize({ planeIndex: 0, format: "f32" }) / 4);
+  lateSample.copyTo(lateF32, { planeIndex: 0, format: "f32" });
+  lateSample.close();
+  assert.ok(lateF32.some((v) => Math.abs(v) > 0.05), "looped BGM should keep playing past 0.2s");
+
+  // H.264 + AAC MP4 with both watermark and non-looping music
+  const comboOpts = await fixture(t, "h264-aac.mp4");
+  const progress = [];
+  const comboRes = await normalizeVideo({
+    ...comboOpts,
+    onProgress: (p) => progress.push(p),
+    watermark: {
+      enabled: true,
+      text: "BOTH",
+      color: "#ffffff",
+      bold: false,
+      backgroundColor: "#000000",
+      backgroundOpacity: 0.7,
+      borderRadius: 4,
+      fontSize: 32,
+      paddingX: 12,
+      paddingY: 8,
+      opacity: 1,
+      position: "bottom-right",
+      marginX: 20,
+      marginY: 20,
+    },
+    music: { handle: musicHandle, volume: 0.4, loop: false },
+  });
+  assert.deepEqual(comboRes, { converted: true });
+  assert.equal(progress.at(-1), 1);
+  await assertMedia(t, comboOpts.outputPath, { width: 64, height: 48, audio: true });
+});
+
+test("cancellation during watermark + music conversion removes partial output", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "bgm-cancel-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const mp3Path = path.join(dir, "bgm.mp3");
+  await createTestMp3(mp3Path, 0.2, 660);
+  const musicHandle = await open(mp3Path, "r");
+  t.after(() => musicHandle.close());
+
+  const options = await fixture(t, "vp9-opus.webm");
+  const controller = new AbortController();
+  await assert.rejects(
+    normalizeVideo({
+      ...options,
+      signal: controller.signal,
+      watermark: {
+        enabled: true,
+        text: "CANCEL",
+        position: "center",
+        marginX: 0,
+        marginY: 0,
+        fontSize: 24,
+        paddingX: 8,
+        paddingY: 4,
+        borderRadius: 4,
+        color: "#ffffff",
+        backgroundColor: "#000000",
+        backgroundOpacity: 0.6,
+        opacity: 1,
+        bold: false,
+      },
+      music: { handle: musicHandle, volume: 0.5, loop: true },
+      onProgress: (value) => {
+        if (value > 0 && value < 1) controller.abort();
+      },
+    }),
+    { name: "AbortError" },
+  );
+  await assert.rejects(stat(options.outputPath), { code: "ENOENT" });
 });

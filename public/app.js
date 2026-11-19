@@ -18,6 +18,10 @@ const paths = {
     '<path d="M3 7V5a1 1 0 0 1 1-1h6l2 3h8a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/>',
   manage: '<path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2" fill="currentColor"/><circle cx="15" cy="12" r="2" fill="currentColor"/><circle cx="9" cy="18" r="2" fill="currentColor"/>',
   trash: '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>',
+  sliders: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+  music: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  pause: '<path d="M8 5h3v14H8zM13 5h3v14h-3z"/>',
+  volume: '<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/>',
 };
 function icon(name) {
   const span = document.createElement("span");
@@ -72,6 +76,52 @@ const management = {
   pageSize: 48,
   selected: new Set(),
 };
+function defaultExportSettings() {
+  return {
+    watermark: {
+      enabled: false,
+      text: "",
+      color: "#ffffff",
+      bold: false,
+      backgroundColor: "#000000",
+      backgroundOpacity: 0.55,
+      borderRadius: 8,
+      fontSize: 28,
+      paddingX: 16,
+      paddingY: 8,
+      opacity: 1,
+      position: "bottom-right",
+      marginX: 24,
+      marginY: 24,
+    },
+    music: {
+      enabled: false,
+      file: "",
+      volume: 0.35,
+      loop: true,
+    },
+  };
+}
+function cloneExportSettings(settings) {
+  return {
+    watermark: { ...settings.watermark },
+    music: { ...settings.music },
+  };
+}
+const exportState = {
+  saved: defaultExportSettings(),
+  draft: defaultExportSettings(),
+  music: [],
+  maxMusicBytes: 50 * 1024 * 1024,
+  loaded: false,
+  saving: false,
+  uploadingMusic: false,
+  previewVideoId: "",
+  auditionName: "",
+  loadError: "",
+};
+const auditionAudio = new Audio();
+let previewResizeObserver = null;
 let deleteTargets = [],
   deleting = false;
 const deletedChanges = new Map();
@@ -667,6 +717,7 @@ function syncManagementSelection() {
 }
 function renderCurrentView() {
   if (state.view === "manage") renderManagement();
+  else if (state.view === "export") renderExportPage();
   else if (state.view === "library") renderLibrary();
 }
 function renderDeleteTargets(failures = []) {
@@ -813,6 +864,7 @@ async function loadLibrary({ notify = false } = {}) {
     state.loaded = true;
     state.loadError = "";
     if (!state.users.some((u) => u.name === state.selected)) state.selected = "";
+    syncPreviewVideoOptions();
     renderCurrentView();
     const playerToggle =
       $("playerProcessedControl").querySelector(".processed-toggle");
@@ -840,25 +892,44 @@ function route() {
   const upload =
     location.hash === "#upload" ||
     (!location.hash && /^\/upload\/?$/.test(location.pathname));
+  const exportPage =
+    location.hash === "#manage/export" ||
+    (!location.hash && /^\/manage\/export\/?$/.test(location.pathname));
   const manage =
-    location.hash === "#manage" ||
-    (!location.hash && /^\/manage\/?$/.test(location.pathname));
-  const isLibrary = !upload && !manage;
-  state.view = upload ? "upload" : manage ? "manage" : "library";
+    !exportPage &&
+    (location.hash === "#manage" ||
+      (!location.hash && /^\/manage\/?$/.test(location.pathname)));
+  const inManageSection = manage || exportPage;
+  const isLibrary = !upload && !inManageSection;
+  state.view = upload ? "upload" : exportPage ? "export" : manage ? "manage" : "library";
   $("userFilters").hidden = !isLibrary;
   $("headerBack").hidden = isLibrary;
+  $("manageNav").hidden = !inManageSection;
   $("libraryView").hidden = !isLibrary;
   $("uploadView").hidden = !upload;
   $("manageView").hidden = !manage;
-  if (manage) $("manageLink").setAttribute("aria-current", "page");
+  $("exportView").hidden = !exportPage;
+  if (inManageSection) $("manageLink").setAttribute("aria-current", "page");
   else $("manageLink").removeAttribute("aria-current");
+  if (manage) $("manageTabVideos").setAttribute("aria-current", "page");
+  else $("manageTabVideos").removeAttribute("aria-current");
+  if (exportPage) $("manageTabExport").setAttribute("aria-current", "page");
+  else $("manageTabExport").removeAttribute("aria-current");
   if (!isLibrary) {
     clearThumbs();
     $("videoGrid").replaceChildren();
   }
+  if (!exportPage) stopExportMedia();
   syncFilterScrollHints();
-  if (state.loaded || state.loadError) renderCurrentView();
-  document.title = upload ? "上传视频 · 片刻" : manage ? "管理视频 · 片刻" : "片刻 · 视频收藏";
+  if (exportPage && !exportState.loaded) loadExportSettings();
+  if (state.loaded || state.loadError || exportPage) renderCurrentView();
+  document.title = upload
+    ? "上传视频 · 片刻"
+    : exportPage
+      ? "水印与音乐 · 片刻"
+      : manage
+        ? "管理视频 · 片刻"
+        : "片刻 · 视频收藏";
 }
 function openPlayer(video) {
   video = state.videos.find((item) => item.id === video.id) || video;
@@ -900,21 +971,36 @@ function closeOnBackdrop(dialog, callback) {
   });
 }
 closeOnBackdrop($("playerDialog"), () => $("playerDialog").close());
+function hasActiveExportEffects() {
+  const wm = exportState.saved.watermark;
+  const mu = exportState.saved.music;
+  return Boolean((wm.enabled && wm.text.trim()) || (mu.enabled && mu.file));
+}
+function activeEffectsLabel(effects) {
+  if (!effects) return "";
+  if (effects.watermark && effects.music) return "水印与背景音乐";
+  if (effects.watermark) return "文字水印";
+  if (effects.music) return "背景音乐";
+  return "";
+}
 function updateDownloadButton(control, video) {
   const entry = downloads.get(video.id);
   const checking = entry?.requesting;
   const busy =
     checking || ["queued", "processing"].includes(entry?.job?.status);
+  const activeEffects = hasActiveExportEffects();
   control.setAttribute("aria-busy", String(!!busy));
   control.setAttribute(
     "aria-label",
-    `${checking ? "正在检查下载格式" : busy ? "查看下载进度" : "下载 H.264 MP4"}：${video.name}`,
+    `${checking ? "正在检查下载格式" : busy ? "查看下载进度" : activeEffects ? "使用 Mediabunny 处理并下载 MP4" : "下载 H.264 MP4"}：${video.name}`,
   );
   control.title = checking
     ? "正在检查下载格式"
     : busy
       ? "点击查看下载准备进度"
-      : "下载 H.264 编码的 MP4";
+      : activeEffects
+        ? "点击后将使用 Mediabunny 添加水印/音乐并导出 MP4"
+        : "下载 H.264 编码的 MP4";
   control.querySelector(".download-label").textContent = checking
     ? "检查中…"
     : busy
@@ -946,15 +1032,28 @@ function renderDownload(entry) {
     Math.min(1, Math.max(0, Number(job?.progress) || 0)) * 100,
   );
   $("downloadName").textContent = entry.video.name;
+  const effectsText = activeEffectsLabel(job?.effects);
   $("downloadStatus").textContent = error
     ? "暂时无法准备下载"
     : ready
-      ? "H.264 MP4 已准备好"
+      ? effectsText
+        ? `已添加${effectsText}，MP4 已准备好`
+        : "H.264 MP4 已准备好"
       : job?.status === "processing"
-        ? "正在检查编码并准备 H.264 MP4…"
+        ? effectsText
+          ? `正在使用 Mediabunny 添加${effectsText}并导出 MP4…`
+          : "正在检查编码并准备 H.264 MP4…"
         : job?.status === "queued"
           ? "正在排队，请稍候…"
           : "正在准备下载…";
+  const progressTitle = $("downloadProgressGroup").querySelector(".progress-meta > span");
+  if (progressTitle) {
+    progressTitle.textContent = effectsText ? `Mediabunny 处理中（${effectsText}）` : "准备 H.264 MP4";
+  }
+  $("readyDownload").replaceChildren(
+    icon("download"),
+    document.createTextNode(effectsText ? "下载处理后的 MP4" : "下载 H.264 MP4"),
+  );
   $("downloadProgress").value = ready ? 100 : progress;
   $("downloadProgressGroup").hidden = ready || !!error;
   $("downloadPercent").textContent = `${progress}%`;
@@ -1464,8 +1563,738 @@ document.addEventListener("dragover", (e) => {
 document.addEventListener("drop", (e) => {
   if (e.dataTransfer.types.includes("Files")) e.preventDefault();
 });
+const EXPORT_FONT_FAMILY =
+  '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif';
+
+function isExportDirty() {
+  return (
+    JSON.stringify(exportState.draft) !== JSON.stringify(exportState.saved)
+  );
+}
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "未知时长";
+  const total = Math.round(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+function syncRangeSlider(input, valueText) {
+  input.style.setProperty("--attr-min", input.min || "0");
+  input.style.setProperty("--attr-max", input.max || "100");
+  input.style.setProperty("--control-value", input.value);
+  if (valueText !== undefined) {
+    input.setAttribute("aria-valuetext", String(valueText));
+  }
+}
+function setSwitchState(control, checked, labelText) {
+  control.setAttribute("aria-checked", String(Boolean(checked)));
+  const label = control.querySelector(".processed-label");
+  if (label && labelText !== undefined) label.textContent = labelText;
+}
+function updateExportActiveBadge() {
+  const wm = exportState.saved.watermark;
+  const mu = exportState.saved.music;
+  const hasWm = Boolean(wm.enabled && wm.text.trim());
+  const hasMu = Boolean(mu.enabled && mu.file);
+  const badge = $("exportActiveBadge");
+  if (hasWm && hasMu) {
+    badge.textContent = "水印+音乐";
+    badge.hidden = false;
+  } else if (hasWm) {
+    badge.textContent = "水印";
+    badge.hidden = false;
+  } else if (hasMu) {
+    badge.textContent = "音乐";
+    badge.hidden = false;
+  } else {
+    badge.textContent = "";
+    badge.hidden = true;
+  }
+  document.querySelectorAll(".download-action").forEach((control) => {
+    const video = state.videos.find((v) => v.id === control.dataset.videoId);
+    if (video) updateDownloadButton(control, video);
+  });
+}
+function stopExportMedia() {
+  $("previewVideo").pause();
+  $("previewAudio").pause();
+  auditionAudio.pause();
+  if (exportState.auditionName) {
+    exportState.auditionName = "";
+    renderMusicList();
+  }
+}
+function drawRoundedRectPath(ctx, x, y, w, h, r) {
+  const radius = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath();
+  if (typeof ctx.roundRect === "function") {
+    ctx.roundRect(x, y, w, h, radius);
+    return;
+  }
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + w, y, x + w, y + h, radius);
+  ctx.arcTo(x + w, y + h, x, y + h, radius);
+  ctx.arcTo(x, y + h, x, y, radius);
+  ctx.arcTo(x, y, x + w, y, radius);
+  ctx.closePath();
+}
+function measureAndRenderWatermarkBadge(wm, scale) {
+  const lines = (wm.text || "").replace(/\r\n?/g, "\n").split("\n");
+  const fontSize = Math.max(1, wm.fontSize * scale);
+  const lineHeight = fontSize * 1.25;
+  const padX = Math.max(0, wm.paddingX * scale);
+  const padY = Math.max(0, wm.paddingY * scale);
+  const font = `${wm.bold ? "700 " : ""}${fontSize}px ${EXPORT_FONT_FAMILY}`;
+
+  const measureCanvas = document.createElement("canvas");
+  const mCtx = measureCanvas.getContext("2d");
+  mCtx.font = font;
+  const maxLineW = Math.max(
+    1,
+    ...lines.map((line) => mCtx.measureText(line || " ").width),
+  );
+  const textH = lines.length * lineHeight;
+  const badgeW = Math.max(2, Math.ceil(maxLineW + padX * 2));
+  const badgeH = Math.max(2, Math.ceil(textH + padY * 2));
+
+  const inner = document.createElement("canvas");
+  inner.width = badgeW;
+  inner.height = badgeH;
+  const iCtx = inner.getContext("2d");
+
+  if (wm.backgroundOpacity > 0) {
+    iCtx.save();
+    iCtx.globalAlpha = wm.backgroundOpacity;
+    iCtx.fillStyle = wm.backgroundColor;
+    drawRoundedRectPath(iCtx, 0, 0, badgeW, badgeH, wm.borderRadius * scale);
+    iCtx.fill();
+    iCtx.restore();
+  }
+
+  iCtx.save();
+  iCtx.font = font;
+  iCtx.fillStyle = wm.color;
+  iCtx.textBaseline = "middle";
+  let align = "left";
+  let textX = padX;
+  if (wm.position.endsWith("-right")) {
+    align = "right";
+    textX = badgeW - padX;
+  } else if (wm.position.endsWith("-center") || wm.position === "center") {
+    align = "center";
+    textX = badgeW / 2;
+  }
+  iCtx.textAlign = align;
+  for (let i = 0; i < lines.length; i++) {
+    iCtx.fillText(lines[i], textX, padY + (i + 0.5) * lineHeight);
+  }
+  iCtx.restore();
+
+  if (wm.opacity >= 0.999) return inner;
+  const out = document.createElement("canvas");
+  out.width = badgeW;
+  out.height = badgeH;
+  const oCtx = out.getContext("2d");
+  oCtx.globalAlpha = wm.opacity;
+  oCtx.drawImage(inner, 0, 0);
+  return out;
+}
+function computePreviewWatermarkPlacement(wm, videoW, videoH, badgeW, badgeH) {
+  const scale = Math.min(videoW, videoH) / 720;
+  const marginX = Math.max(0, Math.round(wm.marginX * scale));
+  const marginY = Math.max(0, Math.round(wm.marginY * scale));
+  let x;
+  if (wm.position.endsWith("-left")) x = marginX;
+  else if (wm.position.endsWith("-right")) x = videoW - badgeW - marginX;
+  else x = Math.round((videoW - badgeW) / 2);
+
+  let y;
+  if (wm.position.startsWith("top-")) y = marginY;
+  else if (wm.position.startsWith("bottom-")) y = videoH - badgeH - marginY;
+  else y = Math.round((videoH - badgeH) / 2);
+
+  return {
+    x: Math.max(0, Math.min(Math.max(0, videoW - badgeW), x)),
+    y: Math.max(0, Math.min(Math.max(0, videoH - badgeH), y)),
+  };
+}
+function exportWatermarkOverlayPng(wm) {
+  const baseCanvas = measureAndRenderWatermarkBadge(wm, 1);
+  const overlayScale = Math.max(
+    0.1,
+    Math.min(3, 3840 / baseCanvas.width, 2160 / baseCanvas.height),
+  );
+  const hiCanvas =
+    Math.abs(overlayScale - 1) < 0.01
+      ? baseCanvas
+      : measureAndRenderWatermarkBadge(wm, overlayScale);
+  const dataUrl = hiCanvas.toDataURL("image/png");
+  return {
+    overlayPng: dataUrl.slice("data:image/png;base64,".length),
+    overlayScale,
+  };
+}
+function drawPreviewWatermark() {
+  const stage = $("previewStage");
+  const video = $("previewVideo");
+  const canvas = $("previewCanvas");
+  const stageW = stage.clientWidth;
+  const stageH = stage.clientHeight;
+  if (!stageW || !stageH) return;
+
+  let dispW = stageW;
+  let dispH = stageH;
+  let offX = 0;
+  let offY = 0;
+  if (!video.hidden && video.videoWidth > 0 && video.videoHeight > 0) {
+    const videoAspect = video.videoWidth / video.videoHeight;
+    const stageAspect = stageW / stageH;
+    if (videoAspect > stageAspect) {
+      dispW = stageW;
+      dispH = stageW / videoAspect;
+      offY = (stageH - dispH) / 2;
+    } else {
+      dispH = stageH;
+      dispW = stageH * videoAspect;
+      offX = (stageW - dispW) / 2;
+    }
+  }
+
+  canvas.style.left = `${offX}px`;
+  canvas.style.top = `${offY}px`;
+  canvas.style.width = `${dispW}px`;
+  canvas.style.height = `${dispH}px`;
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const pxW = Math.max(1, Math.round(dispW * dpr));
+  const pxH = Math.max(1, Math.round(dispH * dpr));
+  if (canvas.width !== pxW || canvas.height !== pxH) {
+    canvas.width = pxW;
+    canvas.height = pxH;
+  }
+
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, pxW, pxH);
+
+  const wm = exportState.draft.watermark;
+  if (!wm.enabled || !wm.text.trim()) return;
+
+  const scale = Math.min(pxW, pxH) / 720;
+  const marginX = Math.max(0, Math.round(wm.marginX * scale));
+  const marginY = Math.max(0, Math.round(wm.marginY * scale));
+  const maxW = Math.max(1, pxW - marginX * 2);
+  const maxH = Math.max(1, pxH - marginY * 2);
+  const badge = measureAndRenderWatermarkBadge(wm, scale);
+  const fit = Math.min(1, maxW / badge.width, maxH / badge.height);
+  const drawW = Math.max(1, Math.round(badge.width * fit));
+  const drawH = Math.max(1, Math.round(badge.height * fit));
+  const { x, y } = computePreviewWatermarkPlacement(wm, pxW, pxH, drawW, drawH);
+  ctx.drawImage(badge, x, y, drawW, drawH);
+}
+function syncPreviewVideoOptions() {
+  const select = $("previewVideoSelect");
+  const videoEl = $("previewVideo");
+  const emptyEl = $("previewEmpty");
+
+  if (!state.videos.length) {
+    exportState.previewVideoId = "";
+    const opt = el("option", "", "暂无示例视频");
+    opt.value = "";
+    select.replaceChildren(opt);
+    select.disabled = true;
+    videoEl.hidden = true;
+    if (videoEl.hasAttribute("src")) {
+      videoEl.pause();
+      videoEl.removeAttribute("src");
+      videoEl.load();
+    }
+    emptyEl.hidden = false;
+    $("previewVideoMeta").textContent = "视频库暂无视频（仍可预览水印效果）";
+    drawPreviewWatermark();
+    return;
+  }
+
+  select.disabled = false;
+  emptyEl.hidden = true;
+  videoEl.hidden = false;
+  select.replaceChildren(
+    ...state.videos.map((v, index) => {
+      const opt = el(
+        "option",
+        "",
+        `${index === 0 ? "[默认第一个] " : ""}${v.user} / ${v.name}`,
+      );
+      opt.value = v.id;
+      return opt;
+    }),
+  );
+
+  if (
+    !exportState.previewVideoId ||
+    !state.videos.some((v) => v.id === exportState.previewVideoId)
+  ) {
+    exportState.previewVideoId = state.videos[0].id;
+  }
+  select.value = exportState.previewVideoId;
+  const active =
+    state.videos.find((v) => v.id === exportState.previewVideoId) ||
+    state.videos[0];
+  if (videoEl.getAttribute("src") !== active.url) {
+    videoEl.src = active.url;
+  }
+  const resText =
+    videoEl.videoWidth > 0
+      ? ` · ${videoEl.videoWidth}×${videoEl.videoHeight}`
+      : "";
+  $("previewVideoMeta").textContent =
+    `${active.user} / ${active.name}${resText}`;
+}
+function syncPreviewAudioSource() {
+  const audioEl = $("previewAudio");
+  const mu = exportState.draft.music;
+  const track = exportState.music.find((item) => item.name === mu.file);
+  audioEl.volume = Math.max(0, Math.min(1, mu.volume));
+  audioEl.loop = Boolean(mu.loop);
+  if (!mu.enabled || !track) {
+    audioEl.pause();
+    if (audioEl.hasAttribute("src")) {
+      audioEl.removeAttribute("src");
+      audioEl.load();
+    }
+    return;
+  }
+  if (audioEl.getAttribute("src") !== track.url) {
+    audioEl.src = track.url;
+  }
+}
+function syncPreviewAudioPlayback() {
+  const videoEl = $("previewVideo");
+  const audioEl = $("previewAudio");
+  const mu = exportState.draft.music;
+  if (
+    !mu.enabled ||
+    !mu.file ||
+    !audioEl.hasAttribute("src") ||
+    videoEl.paused ||
+    videoEl.ended
+  ) {
+    audioEl.pause();
+    return;
+  }
+  auditionAudio.pause();
+  if (exportState.auditionName) {
+    exportState.auditionName = "";
+    renderMusicList();
+  }
+  const dur = audioEl.duration;
+  if (Number.isFinite(dur) && dur > 0) {
+    if (!mu.loop && videoEl.currentTime >= dur) {
+      audioEl.pause();
+      return;
+    }
+    const target = mu.loop ? videoEl.currentTime % dur : videoEl.currentTime;
+    if (Math.abs(audioEl.currentTime - target) > 0.25) {
+      audioEl.currentTime = target;
+    }
+  }
+  audioEl.play().catch(() => {});
+}
+function renderPreviewSummary() {
+  const wm = exportState.draft.watermark;
+  const mu = exportState.draft.music;
+  const parts = [];
+  if (wm.enabled && wm.text.trim()) parts.push("文字水印");
+  else if (wm.enabled) parts.push("水印已开启（未填内容）");
+  if (mu.enabled && mu.file) parts.push(`背景音乐（${mu.file}）`);
+  else if (mu.enabled) parts.push("音乐已开启（未选文件）");
+  $("previewEffectsSummary").textContent = parts.length
+    ? `预览效果：${parts.join(" + ")}`
+    : "当前未开启水印和音乐（直接下载原格式）";
+}
+function renderMusicList() {
+  const list = $("musicList");
+  const empty = $("musicEmpty");
+  const tracks = exportState.music;
+  list.hidden = !tracks.length;
+  empty.hidden = tracks.length > 0;
+  if (!tracks.length) {
+    list.replaceChildren();
+    return;
+  }
+  list.replaceChildren(
+    ...tracks.map((track) => {
+      const selected = exportState.draft.music.file === track.name;
+      const playing =
+        exportState.auditionName === track.name && !auditionAudio.paused;
+      const item = el("div", `music-item${selected ? " is-selected" : ""}`);
+      const selectBtn = el("button", "music-select");
+      selectBtn.type = "button";
+      selectBtn.setAttribute("role", "radio");
+      selectBtn.setAttribute("aria-checked", String(selected));
+      selectBtn.addEventListener("click", () => {
+        exportState.draft.music.file = track.name;
+        syncPreviewAudioSource();
+        syncPreviewAudioPlayback();
+        renderMusicList();
+        renderExportStatus();
+      });
+      const radio = el("span", "music-radio");
+      radio.setAttribute("aria-hidden", "true");
+      const info = el("span", "music-item-info");
+      const title = el("span", "music-item-name", track.name);
+      title.title = track.name;
+      const meta = el(
+        "span",
+        "music-item-meta",
+        `${formatDuration(track.duration)} · ${formatSize(track.size)}`,
+      );
+      info.append(title, meta);
+      selectBtn.append(radio, info);
+
+      const actions = el("div", "music-item-actions");
+      const playBtn = button(
+        "",
+        `icon-button music-item-btn${playing ? " is-playing" : ""}`,
+        () => toggleAuditionMusic(track),
+        playing ? "pause" : "play",
+      );
+      playBtn.setAttribute(
+        "aria-label",
+        `${playing ? "暂停试听" : "试听"} ${track.name}`,
+      );
+      playBtn.title = playing ? "暂停试听" : "试听 MP3";
+      const delBtn = button(
+        "",
+        "icon-button music-item-btn danger-icon",
+        () => deleteMusicFile(track.name),
+        "trash",
+      );
+      delBtn.setAttribute("aria-label", `删除 ${track.name}`);
+      delBtn.title = "删除此 MP3";
+      actions.append(playBtn, delBtn);
+
+      item.append(selectBtn, actions);
+      return item;
+    }),
+  );
+}
+function toggleAuditionMusic(track) {
+  if (exportState.auditionName === track.name && !auditionAudio.paused) {
+    auditionAudio.pause();
+    exportState.auditionName = "";
+    renderMusicList();
+    return;
+  }
+  $("previewVideo").pause();
+  $("previewAudio").pause();
+  exportState.auditionName = track.name;
+  auditionAudio.src = track.url;
+  auditionAudio.volume = Math.max(0, Math.min(1, exportState.draft.music.volume));
+  auditionAudio
+    .play()
+    .then(() => renderMusicList())
+    .catch(() => {
+      exportState.auditionName = "";
+      renderMusicList();
+      showToast("无法试听此音频文件");
+    });
+}
+async function deleteMusicFile(name) {
+  if (exportState.uploadingMusic || exportState.saving) return;
+  $("musicError").hidden = true;
+  try {
+    const data = await api("/api/music", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (exportState.auditionName === name) {
+      auditionAudio.pause();
+      exportState.auditionName = "";
+    }
+    if (data.settings) {
+      exportState.saved = cloneExportSettings(data.settings);
+      if (exportState.draft.music.file === name) {
+        exportState.draft.music.file = "";
+        exportState.draft.music.enabled = false;
+      }
+    }
+    exportState.music = exportState.music.filter((t) => t.name !== name);
+    downloads.clear();
+    updateExportActiveBadge();
+    renderExportPage();
+    showToast(`已删除背景音乐 ${name}`);
+  } catch (error) {
+    $("musicError").textContent = error.message;
+    $("musicError").hidden = false;
+  }
+}
+function uploadSingleMusic(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const p = new URLSearchParams({ name: file.name });
+    xhr.open("POST", `/api/music?${p}`);
+    xhr.setRequestHeader("Content-Type", file.type || "audio/mpeg");
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(e.loaded, e.total);
+    };
+    xhr.onerror = () => reject(new Error("网络连接中断，请重试"));
+    xhr.onabort = () => reject(new Error("上传已取消"));
+    xhr.onload = () => {
+      let data;
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch {
+        data = { error: "服务器返回了无效响应" };
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data.error || `上传失败（${xhr.status}）`));
+    };
+    xhr.send(file);
+  });
+}
+async function uploadMusicFiles(fileList) {
+  const files = [...fileList];
+  if (!files.length || exportState.uploadingMusic) return;
+  $("musicError").hidden = true;
+  const rejected = [];
+  const accepted = [];
+  for (const file of files) {
+    if (!/\.mp3$/i.test(file.name)) {
+      rejected.push(`${file.name}：仅支持 MP3 格式`);
+      continue;
+    }
+    if (!file.size) {
+      rejected.push(`${file.name}：文件为空`);
+      continue;
+    }
+    if (file.size > exportState.maxMusicBytes) {
+      rejected.push(
+        `${file.name}：超过 ${formatSize(exportState.maxMusicBytes)} 限制`,
+      );
+      continue;
+    }
+    accepted.push(file);
+  }
+  if (rejected.length) {
+    $("musicError").textContent = rejected.join("；");
+    $("musicError").hidden = false;
+  }
+  if (!accepted.length) return;
+
+  exportState.uploadingMusic = true;
+  $("musicDropZone").disabled = true;
+  $("musicUploadStatus").hidden = false;
+  let uploadedCount = 0;
+  let lastTrack = null;
+  try {
+    for (let i = 0; i < accepted.length; i++) {
+      const file = accepted[i];
+      $("musicUploadStatus").textContent =
+        `正在上传 ${i + 1} / ${accepted.length}：${file.name}…`;
+      try {
+        const res = await uploadSingleMusic(file, (loaded, total) => {
+          const pct = Math.round((loaded / total) * 100);
+          $("musicUploadStatus").textContent =
+            pct >= 100
+              ? `正在验证 ${file.name}…`
+              : `正在上传 ${i + 1} / ${accepted.length}：${file.name}（${pct}%）`;
+        });
+        lastTrack = res.track;
+        uploadedCount++;
+      } catch (error) {
+        $("musicError").textContent = `${file.name}：${error.message}`;
+        $("musicError").hidden = false;
+      }
+    }
+    const refreshed = await api("/api/music");
+    exportState.music = refreshed.music || [];
+    if (lastTrack && !exportState.draft.music.file) {
+      exportState.draft.music.file = lastTrack.name;
+    }
+    if (uploadedCount) showToast(`已上传 ${uploadedCount} 首 MP3`);
+  } catch (error) {
+    $("musicError").textContent = error.message;
+    $("musicError").hidden = false;
+  } finally {
+    exportState.uploadingMusic = false;
+    $("musicDropZone").disabled = false;
+    $("musicUploadStatus").hidden = true;
+    renderExportPage();
+  }
+}
+function renderExportStatus() {
+  const dirty = isExportDirty();
+  $("exportDirtyState").textContent = exportState.saving
+    ? "正在保存…"
+    : dirty
+      ? "有未保存更改"
+      : "已保存";
+  $("exportDirtyState").classList.toggle("is-dirty", dirty && !exportState.saving);
+  $("exportSave").disabled = exportState.saving;
+  $("exportReset").disabled = exportState.saving;
+  renderPreviewSummary();
+}
+function renderExportControls() {
+  const wm = exportState.draft.watermark;
+  const mu = exportState.draft.music;
+
+  setSwitchState($("wmEnabled"), wm.enabled, wm.enabled ? "已开启" : "已关闭");
+  $("wmFields").disabled = !wm.enabled;
+  $("wmText").value = wm.text;
+  $("wmColor").value = wm.color;
+  $("wmColorHex").textContent = wm.color;
+  setSwitchState($("wmBold"), wm.bold, wm.bold ? "加粗" : "常规");
+
+  $("wmFontSize").value = String(wm.fontSize);
+  $("wmFontSizeValue").textContent = `${wm.fontSize} px`;
+  syncRangeSlider($("wmFontSize"), `${wm.fontSize} px`);
+
+  $("wmBgColor").value = wm.backgroundColor;
+  $("wmBgColorHex").textContent = wm.backgroundColor;
+
+  const bgOpacityPct = Math.round(wm.backgroundOpacity * 100);
+  $("wmBgOpacity").value = String(bgOpacityPct);
+  $("wmBgOpacityValue").textContent = `${bgOpacityPct}%`;
+  syncRangeSlider($("wmBgOpacity"), `${bgOpacityPct}%`);
+
+  $("wmBorderRadius").value = String(wm.borderRadius);
+  $("wmBorderRadiusValue").textContent = `${wm.borderRadius} px`;
+  syncRangeSlider($("wmBorderRadius"), `${wm.borderRadius} px`);
+
+  const opacityPct = Math.round(wm.opacity * 100);
+  $("wmOpacity").value = String(opacityPct);
+  $("wmOpacityValue").textContent = `${opacityPct}%`;
+  syncRangeSlider($("wmOpacity"), `${opacityPct}%`);
+
+  $("wmPositionGrid")
+    .querySelectorAll("button")
+    .forEach((btn) => {
+      btn.setAttribute(
+        "aria-pressed",
+        String(btn.dataset.position === wm.position),
+      );
+    });
+
+  $("wmMarginX").value = String(wm.marginX);
+  $("wmMarginXValue").textContent = `${wm.marginX} px`;
+  syncRangeSlider($("wmMarginX"), `${wm.marginX} px`);
+
+  $("wmMarginY").value = String(wm.marginY);
+  $("wmMarginYValue").textContent = `${wm.marginY} px`;
+  syncRangeSlider($("wmMarginY"), `${wm.marginY} px`);
+
+  $("wmPaddingX").value = String(wm.paddingX);
+  $("wmPaddingXValue").textContent = `${wm.paddingX} px`;
+  syncRangeSlider($("wmPaddingX"), `${wm.paddingX} px`);
+
+  $("wmPaddingY").value = String(wm.paddingY);
+  $("wmPaddingYValue").textContent = `${wm.paddingY} px`;
+  syncRangeSlider($("wmPaddingY"), `${wm.paddingY} px`);
+
+  setSwitchState(
+    $("musicEnabled"),
+    mu.enabled,
+    mu.enabled ? "已开启" : "已关闭",
+  );
+  $("musicFields").disabled = !mu.enabled;
+
+  const volPct = Math.round(mu.volume * 100);
+  $("musicVolume").value = String(volPct);
+  $("musicVolumeValue").textContent = `${volPct}%`;
+  syncRangeSlider($("musicVolume"), `${volPct}%`);
+
+  setSwitchState($("musicLoop"), mu.loop, mu.loop ? "开启循环" : "单次播放");
+}
+function renderExportPage() {
+  if (state.view !== "export") return;
+  if (exportState.loadError) {
+    $("exportError").textContent = exportState.loadError;
+    $("exportError").hidden = false;
+  } else {
+    $("exportError").hidden = true;
+  }
+  syncPreviewVideoOptions();
+  renderExportControls();
+  renderMusicList();
+  syncPreviewAudioSource();
+  drawPreviewWatermark();
+  renderExportStatus();
+}
+async function loadExportSettings({ silent = false } = {}) {
+  try {
+    const wasDirty = isExportDirty();
+    const data = await api("/api/export-settings");
+    exportState.saved = cloneExportSettings(data.settings);
+    if (!exportState.loaded || !wasDirty) {
+      exportState.draft = cloneExportSettings(data.settings);
+    }
+    exportState.music = data.music || [];
+    exportState.maxMusicBytes = data.maxMusicBytes || exportState.maxMusicBytes;
+    if (
+      exportState.draft.music.file &&
+      !exportState.music.some((t) => t.name === exportState.draft.music.file)
+    ) {
+      exportState.draft.music.file = "";
+    }
+    exportState.loaded = true;
+    exportState.loadError = "";
+    updateExportActiveBadge();
+    if (state.view === "export") renderExportPage();
+  } catch (error) {
+    exportState.loadError = error.message;
+    if (!silent) showToast(`读取设置失败：${error.message}`);
+    if (state.view === "export") renderExportPage();
+  }
+}
+async function saveExportSettings() {
+  if (exportState.saving) return;
+  $("exportError").hidden = true;
+  const wm = exportState.draft.watermark;
+  const mu = exportState.draft.music;
+  if (wm.enabled && !wm.text.trim()) {
+    $("exportError").textContent = "开启文字水印时，请先输入水印内容。";
+    $("exportError").hidden = false;
+    $("wmText").focus();
+    return;
+  }
+  if (mu.enabled && !mu.file) {
+    $("exportError").textContent = "开启背景音乐前，请先上传并选择一首 MP3。";
+    $("exportError").hidden = false;
+    return;
+  }
+
+  exportState.saving = true;
+  renderExportStatus();
+  try {
+    const payload = { settings: exportState.draft };
+    if (wm.enabled && wm.text.trim()) {
+      const overlay = exportWatermarkOverlayPng(wm);
+      payload.overlayPng = overlay.overlayPng;
+      payload.overlayScale = overlay.overlayScale;
+    }
+    const data = await api("/api/export-settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    exportState.saved = cloneExportSettings(data.settings);
+    exportState.draft = cloneExportSettings(data.settings);
+    downloads.clear();
+    updateExportActiveBadge();
+    renderExportPage();
+    showToast("水印与音乐设置已保存，所有下载将按新设置处理");
+  } catch (error) {
+    $("exportError").textContent = error.message;
+    $("exportError").hidden = false;
+  } finally {
+    exportState.saving = false;
+    renderExportStatus();
+  }
+}
+
 window.addEventListener("beforeunload", (e) => {
-  if (uploading || deleting) {
+  if (uploading || deleting || isExportDirty()) {
     e.preventDefault();
     e.returnValue = "";
   }
@@ -1544,8 +2373,154 @@ $("deleteDialog").addEventListener("cancel", (event) => {
 });
 $("deleteDialog").addEventListener("close", () => { deleteTargets = []; });
 closeOnBackdrop($("deleteDialog"), closeDelete);
+
+// Export settings page events
+$("previewVideoSelect").addEventListener("change", () => {
+  exportState.previewVideoId = $("previewVideoSelect").value;
+  syncPreviewVideoOptions();
+  drawPreviewWatermark();
+});
+$("previewVideo").addEventListener("loadedmetadata", () => {
+  const active = state.videos.find((v) => v.id === exportState.previewVideoId);
+  if (active && $("previewVideo").videoWidth > 0) {
+    $("previewVideoMeta").textContent =
+      `${active.user} / ${active.name} · ${$("previewVideo").videoWidth}×${$("previewVideo").videoHeight}`;
+  }
+  drawPreviewWatermark();
+});
+$("previewVideo").addEventListener("play", syncPreviewAudioPlayback);
+$("previewVideo").addEventListener("pause", () => $("previewAudio").pause());
+$("previewVideo").addEventListener("ended", () => $("previewAudio").pause());
+$("previewVideo").addEventListener("seeked", syncPreviewAudioPlayback);
+auditionAudio.addEventListener("ended", () => {
+  exportState.auditionName = "";
+  renderMusicList();
+});
+if (typeof ResizeObserver === "function") {
+  previewResizeObserver = new ResizeObserver(() => {
+    if (state.view === "export") drawPreviewWatermark();
+  });
+  previewResizeObserver.observe($("previewStage"));
+}
+
+$("wmEnabled").addEventListener("click", () => {
+  exportState.draft.watermark.enabled = !exportState.draft.watermark.enabled;
+  renderExportControls();
+  drawPreviewWatermark();
+  renderExportStatus();
+});
+$("wmText").addEventListener("input", () => {
+  exportState.draft.watermark.text = $("wmText").value;
+  drawPreviewWatermark();
+  renderExportStatus();
+});
+$("wmColor").addEventListener("input", () => {
+  exportState.draft.watermark.color = $("wmColor").value.toLowerCase();
+  $("wmColorHex").textContent = exportState.draft.watermark.color;
+  drawPreviewWatermark();
+  renderExportStatus();
+});
+$("wmBold").addEventListener("click", () => {
+  exportState.draft.watermark.bold = !exportState.draft.watermark.bold;
+  renderExportControls();
+  drawPreviewWatermark();
+  renderExportStatus();
+});
+$("wmBgColor").addEventListener("input", () => {
+  exportState.draft.watermark.backgroundColor = $("wmBgColor").value.toLowerCase();
+  $("wmBgColorHex").textContent = exportState.draft.watermark.backgroundColor;
+  drawPreviewWatermark();
+  renderExportStatus();
+});
+for (const [id, field, scale, unit] of [
+  ["wmFontSize", "fontSize", 1, " px"],
+  ["wmBgOpacity", "backgroundOpacity", 0.01, "%"],
+  ["wmBorderRadius", "borderRadius", 1, " px"],
+  ["wmOpacity", "opacity", 0.01, "%"],
+  ["wmMarginX", "marginX", 1, " px"],
+  ["wmMarginY", "marginY", 1, " px"],
+  ["wmPaddingX", "paddingX", 1, " px"],
+  ["wmPaddingY", "paddingY", 1, " px"],
+]) {
+  $(id).addEventListener("input", () => {
+    const raw = Number($(id).value);
+    exportState.draft.watermark[field] = scale === 1 ? Math.round(raw) : raw * scale;
+    const text = `${raw}${unit}`;
+    $(`${id}Value`).textContent = text;
+    syncRangeSlider($(id), text);
+    drawPreviewWatermark();
+    renderExportStatus();
+  });
+}
+$("wmPositionGrid").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-position]");
+  if (!btn || $("wmFields").disabled) return;
+  exportState.draft.watermark.position = btn.dataset.position;
+  renderExportControls();
+  drawPreviewWatermark();
+  renderExportStatus();
+});
+
+$("musicEnabled").addEventListener("click", () => {
+  exportState.draft.music.enabled = !exportState.draft.music.enabled;
+  renderExportControls();
+  syncPreviewAudioSource();
+  syncPreviewAudioPlayback();
+  renderExportStatus();
+});
+$("musicVolume").addEventListener("input", () => {
+  const pct = Number($("musicVolume").value);
+  exportState.draft.music.volume = pct / 100;
+  const text = `${pct}%`;
+  $("musicVolumeValue").textContent = text;
+  syncRangeSlider($("musicVolume"), text);
+  $("previewAudio").volume = exportState.draft.music.volume;
+  if (!auditionAudio.paused) auditionAudio.volume = exportState.draft.music.volume;
+  renderExportStatus();
+});
+$("musicLoop").addEventListener("click", () => {
+  exportState.draft.music.loop = !exportState.draft.music.loop;
+  renderExportControls();
+  syncPreviewAudioSource();
+  syncPreviewAudioPlayback();
+  renderExportStatus();
+});
+
+$("musicDropZone").addEventListener("click", () => $("musicFileInput").click());
+$("musicFileInput").addEventListener("change", () => {
+  uploadMusicFiles($("musicFileInput").files);
+  $("musicFileInput").value = "";
+});
+for (const event of ["dragenter", "dragover"]) {
+  $("musicDropZone").addEventListener(event, (e) => {
+    e.preventDefault();
+    if (!exportState.uploadingMusic) $("musicDropZone").classList.add("dragover");
+  });
+}
+for (const event of ["dragleave", "drop"]) {
+  $("musicDropZone").addEventListener(event, (e) => {
+    e.preventDefault();
+    $("musicDropZone").classList.remove("dragover");
+  });
+}
+$("musicDropZone").addEventListener("drop", (e) => {
+  uploadMusicFiles(e.dataTransfer.files);
+});
+
+$("exportSave").addEventListener("click", saveExportSettings);
+$("exportReset").addEventListener("click", () => {
+  const preservedFile = exportState.draft.music.file;
+  exportState.draft = defaultExportSettings();
+  if (preservedFile && exportState.music.some((t) => t.name === preservedFile)) {
+    exportState.draft.music.file = preservedFile;
+  }
+  $("exportError").hidden = true;
+  renderExportPage();
+});
+
 window.addEventListener("hashchange", route);
 for (let i = 0; i < 8; i++)
   $("videoGrid").append(el("div", "loading-placeholder"));
 route();
 loadLibrary();
+loadExportSettings({ silent: true });

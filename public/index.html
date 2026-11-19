@@ -29,7 +29,7 @@
           <button class="button primary" id="quickUpload">
             <span data-icon="plus"></span>上传视频
           </button>
-          <a href="#manage" id="manageLink" class="icon-button" title="管理视频" aria-label="管理视频">
+          <a href="#manage" id="manageLink" class="icon-button" title="管理与设置" aria-label="管理与设置">
             <span data-icon="manage"></span>
           </a>
         </div>
@@ -110,6 +110,15 @@
           </div>
         </section>
       </section>
+      <nav id="manageNav" class="manage-nav" aria-label="管理页面导航" hidden>
+        <a href="#manage" id="manageTabVideos" class="manage-tab">
+          <span data-icon="film"></span>视频管理
+        </a>
+        <a href="#manage/export" id="manageTabExport" class="manage-tab">
+          <span data-icon="sliders"></span>水印与音乐
+          <span id="exportActiveBadge" class="manage-tab-badge" hidden></span>
+        </a>
+      </nav>
       <section id="manageView" class="manage-view" hidden aria-label="管理视频">
         <div class="toolbar management-toolbar">
           <label class="search-box"><span data-icon="search"></span><input id="manageSearch" type="search" placeholder="搜索视频名称…" aria-label="搜索管理列表" /></label>
@@ -149,6 +158,246 @@
           <label class="page-size">每页 <select id="managePageSize" aria-label="管理列表每页视频数"><option value="48">48</option><option value="96">96</option><option value="192">192</option></select> 条</label>
           <nav id="managePagination" class="pagination" aria-label="管理列表分页"></nav>
           <span id="managePageSummary" class="page-summary"></span>
+        </div>
+      </section>
+      <section id="exportView" class="export-view" hidden aria-label="水印与音乐设置">
+        <div class="export-header">
+          <div class="export-heading">
+            <h1>下载导出处理：水印与音乐</h1>
+            <p>开启后，视频库中所有视频在点击下载时都会通过 Mediabunny 处理后导出，原视频文件保持不变。</p>
+          </div>
+          <div class="export-actions">
+            <span id="exportDirtyState" class="export-dirty-state" role="status" aria-live="polite">已保存</span>
+            <button id="exportReset" class="button secondary" type="button">重置默认</button>
+            <button id="exportSave" class="button primary" type="button">保存设置</button>
+          </div>
+        </div>
+        <p id="exportError" class="error-message" role="alert" hidden></p>
+        <div class="export-layout">
+          <div class="export-preview-col">
+            <div class="preview-card">
+              <div class="preview-card-head">
+                <div class="preview-card-title">
+                  <span data-icon="play"></span>
+                  <strong>实时预览</strong>
+                </div>
+                <label class="sort-control preview-video-picker">
+                  <span data-icon="film"></span>
+                  <select id="previewVideoSelect" aria-label="选择预览示例视频"></select>
+                </label>
+              </div>
+              <div id="previewStage" class="preview-stage">
+                <video id="previewVideo" controls playsinline preload="metadata"></video>
+                <div id="previewEmpty" class="preview-empty" hidden>
+                  <span data-icon="film"></span>
+                  <strong>暂无示例视频</strong>
+                  <span>上传视频后，默认使用视频库中的第一个视频实时预览水印和背景音乐。</span>
+                </div>
+                <canvas id="previewCanvas" class="preview-watermark-canvas" aria-hidden="true"></canvas>
+              </div>
+              <audio id="previewAudio" preload="auto"></audio>
+              <div class="preview-meta-bar">
+                <span id="previewVideoMeta" class="preview-video-meta">等待读取示例视频…</span>
+                <span id="previewEffectsSummary" class="preview-effects-summary">当前未开启水印和音乐</span>
+              </div>
+            </div>
+          </div>
+          <div class="export-controls-col">
+            <section class="settings-card" aria-labelledby="watermarkCardTitle">
+              <div class="settings-card-head">
+                <div>
+                  <h2 id="watermarkCardTitle">文字水印</h2>
+                  <p>在导出视频画面上叠加可自定义样式的文字水印。</p>
+                </div>
+                <button
+                  type="button"
+                  id="wmEnabled"
+                  class="processed-toggle"
+                  role="switch"
+                  aria-checked="false"
+                  aria-label="下载时添加文字水印"
+                >
+                  <span class="processed-track" aria-hidden="true"></span>
+                  <span class="processed-label">已关闭</span>
+                </button>
+              </div>
+              <fieldset id="wmFields" class="settings-fields">
+                <div class="field-block">
+                  <label class="field-label" for="wmText">水印内容</label>
+                  <textarea
+                    id="wmText"
+                    class="field-textarea"
+                    rows="2"
+                    maxlength="200"
+                    placeholder="输入水印文字，支持换行（最多 200 字）…"
+                  ></textarea>
+                </div>
+                <div class="field-grid-2">
+                  <div class="field-block">
+                    <label class="field-label" for="wmColor">文字颜色</label>
+                    <div class="color-control">
+                      <input id="wmColor" class="color-input" type="color" value="#ffffff" />
+                      <span id="wmColorHex" class="color-hex">#ffffff</span>
+                    </div>
+                  </div>
+                  <div class="field-block">
+                    <span class="field-label" id="wmBoldLabel">字体粗细</span>
+                    <button
+                      type="button"
+                      id="wmBold"
+                      class="processed-toggle field-switch"
+                      role="switch"
+                      aria-checked="false"
+                      aria-labelledby="wmBoldLabel"
+                    >
+                      <span class="processed-track" aria-hidden="true"></span>
+                      <span class="processed-label">常规</span>
+                    </button>
+                  </div>
+                </div>
+                <div class="field-block">
+                  <div class="range-head">
+                    <label class="field-label" for="wmFontSize">字体大小</label>
+                    <span id="wmFontSizeValue" class="range-value">28 px</span>
+                  </div>
+                  <input id="wmFontSize" class="export-range" type="range" min="12" max="120" step="1" value="28" />
+                </div>
+                <div class="field-grid-2">
+                  <div class="field-block">
+                    <label class="field-label" for="wmBgColor">背景颜色</label>
+                    <div class="color-control">
+                      <input id="wmBgColor" class="color-input" type="color" value="#000000" />
+                      <span id="wmBgColorHex" class="color-hex">#000000</span>
+                    </div>
+                  </div>
+                  <div class="field-block">
+                    <div class="range-head">
+                      <label class="field-label" for="wmBgOpacity">背景透明度</label>
+                      <span id="wmBgOpacityValue" class="range-value">55%</span>
+                    </div>
+                    <input id="wmBgOpacity" class="export-range" type="range" min="0" max="100" step="1" value="55" />
+                  </div>
+                </div>
+                <div class="field-grid-2">
+                  <div class="field-block">
+                    <div class="range-head">
+                      <label class="field-label" for="wmBorderRadius">背景圆角</label>
+                      <span id="wmBorderRadiusValue" class="range-value">8 px</span>
+                    </div>
+                    <input id="wmBorderRadius" class="export-range" type="range" min="0" max="64" step="1" value="8" />
+                  </div>
+                  <div class="field-block">
+                    <div class="range-head">
+                      <label class="field-label" for="wmOpacity">整体透明度</label>
+                      <span id="wmOpacityValue" class="range-value">100%</span>
+                    </div>
+                    <input id="wmOpacity" class="export-range" type="range" min="10" max="100" step="1" value="100" />
+                  </div>
+                </div>
+                <div class="field-block">
+                  <span class="field-label" id="wmPositionLabel">水印位置</span>
+                  <div id="wmPositionGrid" class="position-grid" role="group" aria-labelledby="wmPositionLabel">
+                    <button type="button" data-position="top-left" aria-pressed="false">左上</button>
+                    <button type="button" data-position="top-center" aria-pressed="false">上中</button>
+                    <button type="button" data-position="top-right" aria-pressed="false">右上</button>
+                    <button type="button" data-position="middle-left" aria-pressed="false">左中</button>
+                    <button type="button" data-position="center" aria-pressed="false">居中</button>
+                    <button type="button" data-position="middle-right" aria-pressed="false">右中</button>
+                    <button type="button" data-position="bottom-left" aria-pressed="false">左下</button>
+                    <button type="button" data-position="bottom-center" aria-pressed="false">下中</button>
+                    <button type="button" data-position="bottom-right" aria-pressed="true">右下</button>
+                  </div>
+                </div>
+                <div class="field-grid-2">
+                  <div class="field-block">
+                    <div class="range-head">
+                      <label class="field-label" for="wmMarginX">水平边距</label>
+                      <span id="wmMarginXValue" class="range-value">24 px</span>
+                    </div>
+                    <input id="wmMarginX" class="export-range" type="range" min="0" max="200" step="1" value="24" />
+                  </div>
+                  <div class="field-block">
+                    <div class="range-head">
+                      <label class="field-label" for="wmMarginY">垂直边距</label>
+                      <span id="wmMarginYValue" class="range-value">24 px</span>
+                    </div>
+                    <input id="wmMarginY" class="export-range" type="range" min="0" max="200" step="1" value="24" />
+                  </div>
+                  <div class="field-block">
+                    <div class="range-head">
+                      <label class="field-label" for="wmPaddingX">左右内边距</label>
+                      <span id="wmPaddingXValue" class="range-value">16 px</span>
+                    </div>
+                    <input id="wmPaddingX" class="export-range" type="range" min="0" max="80" step="1" value="16" />
+                  </div>
+                  <div class="field-block">
+                    <div class="range-head">
+                      <label class="field-label" for="wmPaddingY">上下内边距</label>
+                      <span id="wmPaddingYValue" class="range-value">8 px</span>
+                    </div>
+                    <input id="wmPaddingY" class="export-range" type="range" min="0" max="60" step="1" value="8" />
+                  </div>
+                </div>
+              </fieldset>
+            </section>
+            <section class="settings-card" aria-labelledby="musicCardTitle">
+              <div class="settings-card-head">
+                <div>
+                  <h2 id="musicCardTitle">背景音乐</h2>
+                  <p>上传并管理 MP3 曲库，下载时与视频原声混合导出。</p>
+                </div>
+                <button
+                  type="button"
+                  id="musicEnabled"
+                  class="processed-toggle"
+                  role="switch"
+                  aria-checked="false"
+                  aria-label="下载时添加背景音乐"
+                >
+                  <span class="processed-track" aria-hidden="true"></span>
+                  <span class="processed-label">已关闭</span>
+                </button>
+              </div>
+              <div class="music-manager">
+                <button type="button" id="musicDropZone" class="music-drop-zone">
+                  <span class="music-drop-icon" data-icon="music"></span>
+                  <strong>上传 MP3 背景音乐</strong>
+                  <span>点击选择或拖入 .mp3 文件（单文件最大 50 MB）</span>
+                </button>
+                <input id="musicFileInput" type="file" accept=".mp3,audio/mpeg" multiple hidden />
+                <p id="musicUploadStatus" class="music-upload-status" role="status" aria-live="polite" hidden></p>
+                <p id="musicError" class="error-message" role="alert" hidden></p>
+                <div id="musicList" class="music-list" role="radiogroup" aria-label="选择背景音乐"></div>
+                <div id="musicEmpty" class="music-empty">还没有上传 MP3 文件，上传后可在这里试听和选择。</div>
+              </div>
+              <fieldset id="musicFields" class="settings-fields">
+                <div class="field-block">
+                  <div class="range-head">
+                    <label class="field-label" for="musicVolume">背景音乐音量</label>
+                    <span id="musicVolumeValue" class="range-value">35%</span>
+                  </div>
+                  <input id="musicVolume" class="export-range" type="range" min="0" max="100" step="1" value="35" />
+                </div>
+                <div class="field-row-between">
+                  <div>
+                    <span class="field-label" id="musicLoopLabel">循环播放</span>
+                    <p class="field-help">当视频时长超过背景音乐时长时，自动从头循环播放。</p>
+                  </div>
+                  <button
+                    type="button"
+                    id="musicLoop"
+                    class="processed-toggle field-switch"
+                    role="switch"
+                    aria-checked="true"
+                    aria-labelledby="musicLoopLabel"
+                  >
+                    <span class="processed-track" aria-hidden="true"></span>
+                    <span class="processed-label">开启循环</span>
+                  </button>
+                </div>
+              </fieldset>
+            </section>
+          </div>
         </div>
       </section>
       <section

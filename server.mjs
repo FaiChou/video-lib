@@ -19,12 +19,49 @@ import { networkInterfaces } from "node:os";
 import { isIP } from "node:net";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { isCompatibleVideo, normalizeVideo } from "./media-converter.mjs";
+import { isCompatibleVideo, isValidMp3, normalizeVideo, validateOverlayPng } from "./media-converter.mjs";
 import { loadProjectEnv } from "./env.mjs";
 
 const PROJECT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HOST = "0.0.0.0";
 const MAX_LIMIT = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_MUSIC_BYTES = 50 * 1024 * 1024;
+const MAX_SETTINGS_BODY_BYTES = 3 * 1024 * 1024;
+const WATERMARK_POSITIONS = new Set([
+  "top-left",
+  "top-center",
+  "top-right",
+  "middle-left",
+  "center",
+  "middle-right",
+  "bottom-left",
+  "bottom-center",
+  "bottom-right",
+]);
+const DEFAULT_EXPORT_SETTINGS = Object.freeze({
+  watermark: Object.freeze({
+    enabled: false,
+    text: "",
+    color: "#ffffff",
+    bold: false,
+    backgroundColor: "#000000",
+    backgroundOpacity: 0.55,
+    borderRadius: 8,
+    fontSize: 28,
+    paddingX: 16,
+    paddingY: 8,
+    opacity: 1,
+    position: "bottom-right",
+    marginX: 24,
+    marginY: 24,
+  }),
+  music: Object.freeze({
+    enabled: false,
+    file: "",
+    volume: 0.35,
+    loop: true,
+  }),
+});
 const VIDEO_TYPES = new Map([
   [".mp4", "video/mp4"],
   [".webm", "video/webm"],
@@ -98,7 +135,7 @@ function json(res, status, data, extraHeaders = {}) {
   res.end(body);
 }
 
-async function readJson(req) {
+async function readJson(req, maxBytes = 16 * 1024) {
   if (
     !/^application\/json(?:\s*;|$)/i.test(req.headers["content-type"] || "")
   ) {
@@ -108,7 +145,7 @@ async function readJson(req) {
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 16 * 1024) throw new HttpError(413, "请求内容过大。");
+    if (size > maxBytes) throw new HttpError(413, "请求内容过大。");
     chunks.push(chunk);
   }
   try {
@@ -116,6 +153,133 @@ async function readJson(req) {
   } catch {
     throw new HttpError(400, "JSON 格式无效。");
   }
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function cloneDefaultExportSettings() {
+  return {
+    watermark: { ...DEFAULT_EXPORT_SETTINGS.watermark },
+    music: { ...DEFAULT_EXPORT_SETTINGS.music },
+  };
+}
+
+function validateNumberField(value, fallback, min, max, label, fail) {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+    fail(`${label} 必须是 ${min} 到 ${max} 之间的数字。`);
+  }
+  return value;
+}
+
+function validateHexColor(value, fallback, label, fail) {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" || !/^#[0-9a-f]{6}$/i.test(value)) {
+    fail(`${label} 必须是 #RRGGBB 格式的颜色值。`);
+  }
+  return value.toLowerCase();
+}
+
+function validateExportSettings(raw, { requireAssets = false } = {}) {
+  const fail = (message) => {
+    throw new HttpError(400, message);
+  };
+  if (!isPlainObject(raw)) fail("设置内容必须是 JSON 对象。");
+  if (!isPlainObject(raw.watermark)) fail("缺少有效的文字水印设置。");
+  if (!isPlainObject(raw.music)) fail("缺少有效的背景音乐设置。");
+
+  const wmRaw = raw.watermark;
+  const muRaw = raw.music;
+  const wmDef = DEFAULT_EXPORT_SETTINGS.watermark;
+  const muDef = DEFAULT_EXPORT_SETTINGS.music;
+
+  const wmEnabled = wmRaw.enabled === undefined ? wmDef.enabled : wmRaw.enabled;
+  if (typeof wmEnabled !== "boolean") fail("水印开关必须是布尔值。");
+
+  const rawText = wmRaw.text === undefined ? wmDef.text : wmRaw.text;
+  if (typeof rawText !== "string") fail("水印文字必须是字符串。");
+  const text = rawText.replace(/\r\n?/g, "\n");
+  if (text.length > 200 || /[\x00-\x09\x0b-\x1f\x7f]/u.test(text)) {
+    fail("水印文字不能超过 200 个字符，且不能包含控制字符。");
+  }
+
+  const bold = wmRaw.bold === undefined ? wmDef.bold : wmRaw.bold;
+  if (typeof bold !== "boolean") fail("水印加粗选项必须是布尔值。");
+
+  const position = wmRaw.position === undefined ? wmDef.position : wmRaw.position;
+  if (typeof position !== "string" || !WATERMARK_POSITIONS.has(position)) {
+    fail("水印位置无效。");
+  }
+
+  const watermark = {
+    enabled: wmEnabled,
+    text,
+    color: validateHexColor(wmRaw.color, wmDef.color, "水印文字颜色", fail),
+    bold,
+    backgroundColor: validateHexColor(wmRaw.backgroundColor, wmDef.backgroundColor, "水印背景颜色", fail),
+    backgroundOpacity: validateNumberField(wmRaw.backgroundOpacity, wmDef.backgroundOpacity, 0, 1, "水印背景透明度", fail),
+    borderRadius: Math.round(validateNumberField(wmRaw.borderRadius, wmDef.borderRadius, 0, 64, "水印背景圆角", fail)),
+    fontSize: Math.round(validateNumberField(wmRaw.fontSize, wmDef.fontSize, 12, 120, "水印字体大小", fail)),
+    paddingX: Math.round(validateNumberField(wmRaw.paddingX, wmDef.paddingX, 0, 80, "水印水平内边距", fail)),
+    paddingY: Math.round(validateNumberField(wmRaw.paddingY, wmDef.paddingY, 0, 60, "水印垂直内边距", fail)),
+    opacity: validateNumberField(wmRaw.opacity, wmDef.opacity, 0.1, 1, "水印整体透明度", fail),
+    position,
+    marginX: Math.round(validateNumberField(wmRaw.marginX, wmDef.marginX, 0, 200, "水印水平边距", fail)),
+    marginY: Math.round(validateNumberField(wmRaw.marginY, wmDef.marginY, 0, 200, "水印垂直边距", fail)),
+  };
+
+  const muEnabled = muRaw.enabled === undefined ? muDef.enabled : muRaw.enabled;
+  if (typeof muEnabled !== "boolean") fail("背景音乐开关必须是布尔值。");
+
+  const file = muRaw.file === undefined ? muDef.file : muRaw.file;
+  if (typeof file !== "string") fail("背景音乐文件名必须是字符串。");
+  if (file !== "") {
+    safeSegment(file, "音频文件名");
+    if (path.extname(file).toLowerCase() !== ".mp3") {
+      fail("背景音乐仅支持 .mp3 文件。");
+    }
+  }
+
+  const loop = muRaw.loop === undefined ? muDef.loop : muRaw.loop;
+  if (typeof loop !== "boolean") fail("背景音乐循环开关必须是布尔值。");
+
+  const music = {
+    enabled: muEnabled,
+    file,
+    volume: validateNumberField(muRaw.volume, muDef.volume, 0, 1, "背景音乐音量", fail),
+    loop,
+  };
+
+  if (requireAssets) {
+    if (watermark.enabled && !watermark.text.trim()) {
+      fail("开启文字水印时，请填写水印内容。");
+    }
+    if (music.enabled && !music.file) {
+      fail("开启背景音乐前，请先上传并选择一首 MP3。");
+    }
+  }
+
+  return { watermark, music };
+}
+
+function watermarkConfigHash(watermark) {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      text: watermark.text,
+      color: watermark.color,
+      bold: watermark.bold,
+      backgroundColor: watermark.backgroundColor,
+      backgroundOpacity: watermark.backgroundOpacity,
+      borderRadius: watermark.borderRadius,
+      fontSize: watermark.fontSize,
+      paddingX: watermark.paddingX,
+      paddingY: watermark.paddingY,
+      opacity: watermark.opacity,
+      position: watermark.position,
+    }))
+    .digest("hex");
 }
 
 function attachmentName(name) {
@@ -177,6 +341,16 @@ export async function createVideoServer(options = {}) {
   ) {
     throw new Error("MAX_UPLOAD_BYTES 必须是 1 到 2147483648 之间的整数。");
   }
+  const maxMusicBytes = Number(
+    options.maxMusicBytes ?? process.env.MAX_MUSIC_BYTES ?? DEFAULT_MAX_MUSIC_BYTES,
+  );
+  if (
+    !Number.isSafeInteger(maxMusicBytes) ||
+    maxMusicBytes < 1 ||
+    maxMusicBytes > MAX_LIMIT
+  ) {
+    throw new Error("MAX_MUSIC_BYTES 必须是 1 到 2147483648 之间的整数。");
+  }
   const dateFormatter = new Intl.DateTimeFormat("en-CA", {
     timeZone,
     year: "numeric",
@@ -217,16 +391,191 @@ export async function createVideoServer(options = {}) {
       throw new Error(`无法读取处理状态 ${processedPath}：${error.message}`);
   }
   let processedWrite = Promise.resolve();
+  const settingsPath = path.join(videoDir, ".export-settings.json");
+  const overlayPngPath = path.join(videoDir, ".watermark-overlay.png");
+  const overlayMetaPath = path.join(videoDir, ".watermark-overlay.meta.json");
+  const requestedMusicDir = path.resolve(
+    options.musicDir ?? path.join(videoDir, ".music"),
+  );
+  let exportSettings = cloneDefaultExportSettings();
+  try {
+    const saved = JSON.parse(await readFile(settingsPath, "utf8"));
+    exportSettings = validateExportSettings(saved);
+  } catch (error) {
+    if (error.code !== "ENOENT")
+      throw new Error(`无法读取导出设置 ${settingsPath}：${error.message}`);
+  }
+  let overlayMeta = null;
+  try {
+    const meta = JSON.parse(await readFile(overlayMetaPath, "utf8"));
+    if (
+      isPlainObject(meta) &&
+      typeof meta.hash === "string" &&
+      /^[a-f0-9]{64}$/.test(meta.hash) &&
+      typeof meta.scale === "number" &&
+      Number.isFinite(meta.scale) &&
+      meta.scale > 0
+    ) {
+      overlayMeta = { hash: meta.hash, scale: meta.scale };
+    }
+  } catch {
+    overlayMeta = null;
+  }
+  let settingsWrite = Promise.resolve();
+
   const convertVideo = options.normalizeVideo ?? normalizeVideo;
   const inspectVideo = options.isCompatibleVideo ?? isCompatibleVideo;
+  const inspectMusic = options.inspectMusic ?? isValidMp3;
+  const validateOverlay = options.validateOverlayPng ?? validateOverlayPng;
   const downloadJobs = new Map();
   const downloadChecks = new Map();
   const downloadReaders = new Map();
   const deletingVideos = new Set();
+  const musicReaders = new Map();
+  const deletingMusic = new Set();
+  const musicDurationCache = new Map();
   const cacheDir = path.join(videoDir, ".transcoded");
   const cacheLifetime = 7 * 24 * 60 * 60 * 1000;
   let conversionTail = Promise.resolve();
   let pendingConversions = 0;
+
+  async function atomicWriteFile(targetPath, data, tempPrefix) {
+    const tempPath = path.join(
+      path.dirname(targetPath),
+      `.${tempPrefix}-${randomUUID()}.tmp`,
+    );
+    let handle;
+    try {
+      handle = await open(tempPath, "wx", 0o600);
+      await handle.writeFile(data);
+      await handle.sync();
+      await handle.close();
+      handle = null;
+      await rename(tempPath, targetPath);
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await unlink(tempPath).catch((error) => {
+        if (error.code !== "ENOENT")
+          console.error("临时文件清理失败:", error.message);
+      });
+    }
+  }
+
+  function updateSettings(run) {
+    const write = settingsWrite.then(run);
+    settingsWrite = write.catch(() => {});
+    return write;
+  }
+
+  async function musicFolder(create = false) {
+    if (create) {
+      await mkdir(requestedMusicDir, { recursive: true });
+    }
+    let info;
+    try {
+      info = await lstat(requestedMusicDir);
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+    const parentReal = await realpath(path.dirname(requestedMusicDir));
+    const expectedReal = path.join(parentReal, path.basename(requestedMusicDir));
+    if (
+      !info.isDirectory() ||
+      info.isSymbolicLink() ||
+      (await realpath(requestedMusicDir)) !== expectedReal
+    ) {
+      throw new HttpError(400, "背景音乐目录必须是真实文件夹。");
+    }
+    return expectedReal;
+  }
+
+  async function openMusic(name) {
+    safeSegment(name, "音频文件名");
+    if (path.extname(name).toLowerCase() !== ".mp3")
+      throw new HttpError(404, "背景音乐不存在。");
+    const folder = await musicFolder(false);
+    if (!folder) throw new HttpError(404, "背景音乐不存在。");
+    const filePath = path.join(folder, name);
+    let handle;
+    try {
+      handle = await open(
+        filePath,
+        constants.O_RDONLY | (constants.O_NOFOLLOW || 0),
+      );
+      const info = await handle.stat();
+      if (!info.isFile()) throw new HttpError(404, "背景音乐不存在。");
+      return { handle, info, filePath };
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      if (["ENOENT", "ENOTDIR", "ELOOP"].includes(error.code))
+        throw new HttpError(404, "背景音乐不存在。");
+      throw error;
+    }
+  }
+
+  async function listMusic() {
+    const folder = await musicFolder(false);
+    if (!folder) return [];
+    const tracks = [];
+    for (const entry of await readdir(folder, { withFileTypes: true })) {
+      if (
+        !entry.isFile() ||
+        entry.isSymbolicLink() ||
+        path.extname(entry.name).toLowerCase() !== ".mp3"
+      )
+        continue;
+      try {
+        safeSegment(entry.name, "音频文件名");
+      } catch {
+        continue;
+      }
+      const filePath = path.join(folder, entry.name);
+      let info;
+      try {
+        info = await lstat(filePath);
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        throw error;
+      }
+      if (!info.isFile() || info.isSymbolicLink()) continue;
+      const cacheKey = `${entry.name}:${info.size}:${info.mtimeMs}:${info.ino}`;
+      let duration = musicDurationCache.get(cacheKey);
+      if (duration === undefined) {
+        let handle;
+        try {
+          handle = await open(
+            filePath,
+            constants.O_RDONLY | (constants.O_NOFOLLOW || 0),
+          );
+          const meta = await inspectMusic({ handle });
+          duration = meta?.duration ?? null;
+        } catch {
+          duration = null;
+        } finally {
+          await handle?.close().catch(() => {});
+        }
+        if (musicDurationCache.size >= 500) musicDurationCache.clear();
+        musicDurationCache.set(cacheKey, duration);
+      }
+      tracks.push({
+        name: entry.name,
+        size: info.size,
+        duration,
+        url: `/music/${encodeURIComponent(entry.name)}`,
+      });
+    }
+    tracks.sort((a, b) =>
+      a.name.localeCompare(b.name, "zh-CN", { numeric: true }),
+    );
+    return tracks;
+  }
+
+  function releaseMusicReader(name) {
+    const count = (musicReaders.get(name) || 0) - 1;
+    if (count > 0) musicReaders.set(name, count);
+    else musicReaders.delete(name);
+  }
 
   // Share one queue between uploads and downloads to bound CPU and codec memory.
   function scheduleConversion(run) {
@@ -267,6 +616,7 @@ export async function createVideoServer(options = {}) {
       status: job.status,
       progress: job.progress,
       name: job.name,
+      effects: job.effects ?? { watermark: false, music: false },
       ...(job.status === "ready" ? { downloadUrl: job.downloadUrl } : {}),
       ...(job.status === "failed" ? { error: job.error } : {}),
     };
@@ -316,10 +666,43 @@ export async function createVideoServer(options = {}) {
     }
   }
 
-  function downloadId(user, name, info) {
-    return createHash("sha256").update(JSON.stringify([
-      "h264-aac-v1", user, name, info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs,
-    ])).digest("hex");
+  function videoCacheTag(user, name, info) {
+    return createHash("sha256")
+      .update(
+        JSON.stringify([
+          "video-v1",
+          user,
+          name,
+          info.dev,
+          info.ino,
+          info.size,
+          info.mtimeMs,
+          info.ctimeMs,
+        ]),
+      )
+      .digest("hex")
+      .slice(0, 16);
+  }
+
+  function downloadId(user, name, info, effectsKey = null) {
+    const tag = videoCacheTag(user, name, info);
+    const rest = createHash("sha256")
+      .update(
+        JSON.stringify([
+          "h264-aac-v2",
+          user,
+          name,
+          info.dev,
+          info.ino,
+          info.size,
+          info.mtimeMs,
+          info.ctimeMs,
+          effectsKey,
+        ]),
+      )
+      .digest("hex")
+      .slice(0, 48);
+    return `${tag}${rest}`;
   }
 
   async function createDownload(req) {
@@ -339,10 +722,92 @@ export async function createVideoServer(options = {}) {
   }
 
   async function prepareDownload(user, name, key) {
-    const { handle, info } = await openVideo(user, name);
-    const id = downloadId(user, name, info);
+    const settingsSnapshot = exportSettings;
+    const overlaySnapshot = overlayMeta;
+    const activeWatermark =
+      settingsSnapshot.watermark.enabled && settingsSnapshot.watermark.text.trim()
+        ? { ...settingsSnapshot.watermark }
+        : null;
+    const activeMusic =
+      settingsSnapshot.music.enabled && settingsSnapshot.music.file
+        ? { ...settingsSnapshot.music }
+        : null;
+
+    let musicHandle = null;
+    let musicInfo = null;
+    let musicTransferred = false;
+    let musicReaderHeld = false;
+
+    if (activeMusic) {
+      if (deletingMusic.has(activeMusic.file)) {
+        throw new HttpError(409, "背景音乐正在删除，请稍后重试。");
+      }
+      musicReaders.set(
+        activeMusic.file,
+        (musicReaders.get(activeMusic.file) || 0) + 1,
+      );
+      musicReaderHeld = true;
+    }
+
+    const { handle, info } = await openVideo(user, name).catch((error) => {
+      if (musicReaderHeld) releaseMusicReader(activeMusic.file);
+      throw error;
+    });
     let transferred = false;
+
     try {
+      if (activeMusic) {
+        try {
+          const openedMusic = await openMusic(activeMusic.file);
+          musicHandle = openedMusic.handle;
+          musicInfo = openedMusic.info;
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) {
+            throw new HttpError(409, "所选背景音乐文件不存在，请到管理页面重新选择。");
+          }
+          throw error;
+        }
+      }
+
+      let overlayBuf = null;
+      let overlayScale = 3;
+      if (
+        activeWatermark &&
+        overlaySnapshot &&
+        overlaySnapshot.hash === watermarkConfigHash(activeWatermark)
+      ) {
+        try {
+          overlayBuf = await readFile(overlayPngPath);
+          overlayScale = overlaySnapshot.scale;
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          overlayBuf = null;
+        }
+      }
+
+      const needsEffects = Boolean(activeWatermark || activeMusic);
+      const effectsKey = needsEffects
+        ? {
+            wm: activeWatermark,
+            ovHash: overlayBuf ? overlaySnapshot.hash : null,
+            ovScale: overlayBuf ? overlayScale : null,
+            mu: activeMusic
+              ? {
+                  file: activeMusic.file,
+                  volume: activeMusic.volume,
+                  loop: activeMusic.loop,
+                  dev: musicInfo.dev,
+                  ino: musicInfo.ino,
+                  size: musicInfo.size,
+                  mtimeMs: musicInfo.mtimeMs,
+                  ctimeMs: musicInfo.ctimeMs,
+                }
+              : null,
+          }
+        : null;
+
+      const id = downloadId(user, name, info, effectsKey);
+
       // Coalesce concurrent checks before probing or submitting a conversion.
       // Each request still closes its own file handle unless the queue owns it.
       if (downloadChecks.has(id))
@@ -353,7 +818,16 @@ export async function createVideoServer(options = {}) {
 
         const target = path.join(cacheDir, `${id}.mp4`);
         const job = {
-          id, sourceKey: key, status: "ready", progress: 1, name: `${path.parse(name).name}.mp4`,
+          id,
+          sourceKey: key,
+          musicFile: activeMusic?.file || null,
+          effects: {
+            watermark: Boolean(activeWatermark),
+            music: Boolean(activeMusic),
+          },
+          status: "ready",
+          progress: 1,
+          name: `${path.parse(name).name}.mp4`,
           downloadUrl: `/api/downloads/${id}/file`,
         };
         let cached;
@@ -375,22 +849,29 @@ export async function createVideoServer(options = {}) {
               throw new HttpError(422, "无法检查此视频的编码，请检查文件是否损坏或下载原文件。");
             }
           }
-          if (compatible) {
+          if (!needsEffects && compatible) {
             job.filePath = path.join(videoDir, user, name);
             job.sourceInfo = info;
           }
         }
         const sourceUnchanged = async () => {
           const after = await handle.stat();
-          return ["dev", "ino", "size", "mtimeMs", "ctimeMs"].every((key) => after[key] === info[key]);
+          return ["dev", "ino", "size", "mtimeMs", "ctimeMs"].every((prop) => after[prop] === info[prop]);
         };
-        if (!await sourceUnchanged())
+        const musicUnchanged = async () => {
+          if (!musicHandle || !musicInfo) return true;
+          const after = await musicHandle.stat();
+          return ["dev", "ino", "size", "mtimeMs", "ctimeMs"].every((prop) => after[prop] === musicInfo[prop]);
+        };
+        if (!(await sourceUnchanged()))
           throw new HttpError(409, "源文件发生变化，请重新下载。");
+        if (!(await musicUnchanged()))
+          throw new HttpError(409, "背景音乐文件发生变化，请重新下载。");
 
         // Keep a bounded status history. Cached files remain reusable after eviction.
         if (downloadJobs.size >= 200) {
-          for (const [key, previous] of downloadJobs) {
-            if (["ready", "failed"].includes(previous.status)) downloadJobs.delete(key);
+          for (const [jobId, previous] of downloadJobs) {
+            if (["ready", "failed"].includes(previous.status)) downloadJobs.delete(jobId);
             if (downloadJobs.size < 200) break;
           }
         }
@@ -408,13 +889,32 @@ export async function createVideoServer(options = {}) {
           try {
             job.status = "processing";
             await prepareCache();
-            const { converted } = await convertVideo({
+            if (!(await sourceUnchanged()))
+              throw new Error("转码期间源文件发生变化，请重新下载。");
+            if (!(await musicUnchanged()))
+              throw new Error("转码期间背景音乐发生变化，请重新下载。");
+            const convertOptions = {
               handle,
               outputPath: tempPath,
               onProgress: (progress) => { job.progress = progress; },
-            });
-            if (!await sourceUnchanged())
+            };
+            if (needsEffects) {
+              convertOptions.watermark = activeWatermark;
+              convertOptions.watermarkOverlay = overlayBuf;
+              convertOptions.watermarkOverlayScale = overlayScale;
+              convertOptions.music = activeMusic
+                ? {
+                    handle: musicHandle,
+                    volume: activeMusic.volume,
+                    loop: activeMusic.loop,
+                  }
+                : null;
+            }
+            const { converted } = await convertVideo(convertOptions);
+            if (!(await sourceUnchanged()))
               throw new Error("转码期间源文件发生变化，请重新下载。");
+            if (!(await musicUnchanged()))
+              throw new Error("转码期间背景音乐发生变化，请重新下载。");
             if (converted) {
               await rename(tempPath, target);
               job.filePath = target;
@@ -430,10 +930,13 @@ export async function createVideoServer(options = {}) {
             job.error = "无法转换此视频，请重试或下载原文件。";
           } finally {
             await handle.close().catch(() => {});
+            if (musicHandle) await musicHandle.close().catch(() => {});
+            if (musicReaderHeld) releaseMusicReader(activeMusic.file);
             await unlink(tempPath).catch(() => {});
           }
         });
         transferred = true;
+        musicTransferred = musicReaderHeld;
         downloadJobs.set(id, job);
         task.catch((error) => console.error("下载任务失败:", error.message));
         return job;
@@ -445,7 +948,11 @@ export async function createVideoServer(options = {}) {
         downloadChecks.delete(id);
       }
     } finally {
-      if (!transferred) await handle.close();
+      if (!transferred) await handle.close().catch(() => {});
+      if (!musicTransferred) {
+        if (musicHandle) await musicHandle.close().catch(() => {});
+        if (musicReaderHeld) releaseMusicReader(activeMusic.file);
+      }
     }
   }
 
@@ -530,23 +1037,12 @@ export async function createVideoServer(options = {}) {
   }
 
   async function saveProcessed(next) {
-    const tempPath = path.join(videoDir, `.processed-${randomUUID()}.tmp`);
-    let handle;
-    try {
-      handle = await open(tempPath, "wx", 0o600);
-      await handle.writeFile(JSON.stringify(next, null, 2) + "\n");
-      await handle.sync();
-      await handle.close();
-      handle = null;
-      await rename(tempPath, processedPath);
-      processedVideos = next;
-    } finally {
-      if (handle) await handle.close().catch(() => {});
-      await unlink(tempPath).catch((error) => {
-        if (error.code !== "ENOENT")
-          console.error("处理状态临时文件清理失败:", error.message);
-      });
-    }
+    await atomicWriteFile(
+      processedPath,
+      JSON.stringify(next, null, 2) + "\n",
+      "processed",
+    );
+    processedVideos = next;
   }
 
   // Include existence checks in this queue so a late status save cannot recreate
@@ -585,11 +1081,16 @@ export async function createVideoServer(options = {}) {
     try {
       return await updateProcessed(async () => {
         const { folder, info } = await videoInfo(user, name);
+        const tag = videoCacheTag(user, name, info);
         const ids = new Set([downloadId(user, name, info)]);
         for (const job of downloadJobs.values()) {
           if (job.sourceKey === key) ids.add(job.id);
         }
         if (await cacheExists()) {
+          const variantPattern = new RegExp(`^${tag}[a-f0-9]{48}\\.mp4$`);
+          for (const entry of await readdir(cacheDir)) {
+            if (variantPattern.test(entry)) ids.add(entry.slice(0, 64));
+          }
           for (const id of ids) {
             await unlink(path.join(cacheDir, `${id}.mp4`)).catch((error) => {
               if (error.code !== "ENOENT") throw error;
@@ -615,6 +1116,282 @@ export async function createVideoServer(options = {}) {
       });
     } finally {
       deletingVideos.delete(key);
+    }
+  }
+
+  async function streamRequestToFile(req, tempPath, maxBytes, limitMessage) {
+    let handle;
+    let size = 0;
+    try {
+      handle = await open(
+        tempPath,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          (constants.O_NOFOLLOW || 0),
+        0o600,
+      );
+      const limiter = new Transform({
+        transform(chunk, encoding, callback) {
+          size += chunk.length;
+          callback(size > maxBytes ? new HttpError(413, limitMessage) : null, chunk);
+        },
+      });
+      // Do not put req in pipeline: destroying IncomingMessage would also destroy
+      // its socket and prevent a useful JSON error when a streamed upload is too big.
+      req.pipe(limiter);
+      const onAborted = () =>
+        limiter.destroy(new HttpError(400, "上传已取消。"));
+      const onError = (error) => limiter.destroy(error);
+      req.once("aborted", onAborted);
+      req.once("error", onError);
+      try {
+        await pipeline(limiter, handle.createWriteStream());
+      } finally {
+        req.unpipe(limiter);
+        req.off("aborted", onAborted);
+        req.off("error", onError);
+      }
+      await handle.close();
+      handle = null;
+      if (!size) throw new HttpError(400, "不能上传空文件。");
+      return size;
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+    }
+  }
+
+  async function publishUniqueFile(sourcePath, folder, name, kind = "文件名") {
+    const ext = path.extname(name);
+    const stem = name.slice(0, -ext.length);
+    for (let attempt = 1; attempt <= 10000; attempt += 1) {
+      const savedName = attempt === 1 ? name : `${stem}_${attempt}${ext}`;
+      safeSegment(savedName, kind);
+      try {
+        await link(sourcePath, path.join(folder, savedName));
+        return savedName;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        if (attempt === 10000)
+          throw new HttpError(409, "同名文件过多，请更换文件名。");
+      }
+    }
+  }
+
+  async function saveExportSettings(req) {
+    const body = await readJson(req, MAX_SETTINGS_BODY_BYTES);
+    const rawSettings =
+      isPlainObject(body) && "settings" in body ? body.settings : body;
+    const next = validateExportSettings(rawSettings, { requireAssets: true });
+
+    let pngBuf = null;
+    let overlayScale = 3;
+    if (
+      isPlainObject(body) &&
+      body.overlayPng !== undefined &&
+      body.overlayPng !== null
+    ) {
+      if (typeof body.overlayPng !== "string" || !body.overlayPng.trim()) {
+        throw new HttpError(400, "水印预览图像无效，请重试。");
+      }
+      let encoded = body.overlayPng.trim();
+      if (encoded.startsWith("data:")) {
+        if (!encoded.startsWith("data:image/png;base64,")) {
+          throw new HttpError(400, "水印预览图像必须是 PNG 格式。");
+        }
+        encoded = encoded.slice("data:image/png;base64,".length);
+      }
+      pngBuf = Buffer.from(encoded, "base64");
+      try {
+        await validateOverlay(pngBuf);
+      } catch {
+        throw new HttpError(400, "水印预览图像无效，请重试。");
+      }
+      overlayScale =
+        typeof body.overlayScale === "number" &&
+        Number.isFinite(body.overlayScale) &&
+        body.overlayScale >= 0.1 &&
+        body.overlayScale <= 4
+          ? body.overlayScale
+          : 3;
+    }
+
+    return updateSettings(async () => {
+      if (next.music.file) {
+        try {
+          const opened = await openMusic(next.music.file);
+          await opened.handle.close().catch(() => {});
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) {
+            throw new HttpError(400, "所选背景音乐文件不存在，请重新选择。");
+          }
+          throw error;
+        }
+      }
+
+      const wmHash = watermarkConfigHash(next.watermark);
+      await atomicWriteFile(
+        settingsPath,
+        JSON.stringify(next, null, 2) + "\n",
+        "export-settings",
+      );
+      exportSettings = next;
+
+      if (next.watermark.enabled && next.watermark.text.trim() && pngBuf) {
+        const meta = { hash: wmHash, scale: overlayScale };
+        await atomicWriteFile(overlayPngPath, pngBuf, "watermark-overlay");
+        await atomicWriteFile(
+          overlayMetaPath,
+          JSON.stringify(meta, null, 2) + "\n",
+          "watermark-meta",
+        );
+        overlayMeta = meta;
+      } else if (
+        !next.watermark.enabled ||
+        !overlayMeta ||
+        overlayMeta.hash !== wmHash
+      ) {
+        await unlink(overlayPngPath).catch((error) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+        await unlink(overlayMetaPath).catch((error) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+        overlayMeta = null;
+      }
+
+      return { settings: exportSettings };
+    });
+  }
+
+  async function uploadMusic(req, url, res) {
+    const originalName = safeSegment(url.searchParams.get("name"), "音频文件名");
+    const extension = path.extname(originalName).toLowerCase();
+    if (extension !== ".mp3") {
+      throw new HttpError(415, "仅支持上传 MP3 背景音乐。");
+    }
+    const declaredLength = req.headers["content-length"];
+    if (
+      declaredLength !== undefined &&
+      (!/^\d+$/.test(declaredLength) || Number(declaredLength) > maxMusicBytes)
+    ) {
+      throw new HttpError(413, "背景音乐超过大小限制。");
+    }
+    const folder = await musicFolder(true);
+    const tempPath = path.join(folder, `.upload-${randomUUID()}.part`);
+    const controller = new AbortController();
+    const onClosed = () => {
+      if (!res.writableEnded) controller.abort();
+    };
+    res.once("close", onClosed);
+    try {
+      await streamRequestToFile(
+        req,
+        tempPath,
+        maxMusicBytes,
+        "背景音乐超过大小限制。",
+      );
+      let meta;
+      try {
+        controller.signal.throwIfAborted();
+        const source = await open(
+          tempPath,
+          constants.O_RDONLY | (constants.O_NOFOLLOW || 0),
+        );
+        try {
+          meta = await inspectMusic({
+            handle: source,
+            signal: controller.signal,
+          });
+        } finally {
+          await source.close();
+        }
+        controller.signal.throwIfAborted();
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        console.error("MP3 检查失败:", error.message);
+        throw new HttpError(422, "无法读取 MP3 文件，请检查文件是否损坏或使用标准 MP3 格式。");
+      }
+      await musicFolder(false);
+      const baseName = safeSegment(`${path.parse(originalName).name}.mp3`, "音频文件名");
+      const savedName = await publishUniqueFile(tempPath, folder, baseName, "音频文件名");
+      const info = await lstat(path.join(folder, savedName));
+      const cacheKey = `${savedName}:${info.size}:${info.mtimeMs}:${info.ino}`;
+      musicDurationCache.set(cacheKey, meta?.duration ?? null);
+      return {
+        track: {
+          name: savedName,
+          size: info.size,
+          duration: meta?.duration ?? null,
+          url: `/music/${encodeURIComponent(savedName)}`,
+        },
+      };
+    } finally {
+      res.off("close", onClosed);
+      await unlink(tempPath).catch((error) => {
+        if (error.code !== "ENOENT")
+          console.error("临时音频清理失败:", error.message);
+      });
+    }
+  }
+
+  async function deleteMusicTrack(req) {
+    const body = await readJson(req);
+    const name = safeSegment(body?.name, "音频文件名");
+    if (path.extname(name).toLowerCase() !== ".mp3") {
+      throw new HttpError(404, "背景音乐不存在。");
+    }
+    if (deletingMusic.has(name)) {
+      throw new HttpError(409, "背景音乐正在删除，请稍后重试。");
+    }
+    if (
+      musicReaders.has(name) ||
+      [...downloadJobs.values()].some(
+        (job) =>
+          job.musicFile === name && ["queued", "processing"].includes(job.status),
+      )
+    ) {
+      throw new HttpError(409, "背景音乐正在用于处理下载，请等待完成后再删除。");
+    }
+    deletingMusic.add(name);
+    try {
+      return await updateSettings(async () => {
+        const opened = await openMusic(name);
+        await opened.handle.close().catch(() => {});
+        const previousSettings = exportSettings;
+        const clearsSelected = previousSettings.music.file === name;
+        if (clearsSelected) {
+          const next = {
+            ...previousSettings,
+            music: { ...previousSettings.music, file: "", enabled: false },
+          };
+          await atomicWriteFile(
+            settingsPath,
+            JSON.stringify(next, null, 2) + "\n",
+            "export-settings",
+          );
+          exportSettings = next;
+        }
+        try {
+          await unlink(opened.filePath);
+        } catch (error) {
+          if (clearsSelected) {
+            await atomicWriteFile(
+              settingsPath,
+              JSON.stringify(previousSettings, null, 2) + "\n",
+              "export-settings",
+            ).catch(() => {});
+            exportSettings = previousSettings;
+          }
+          throw error;
+        }
+        for (const [id, job] of downloadJobs) {
+          if (job.musicFile === name) downloadJobs.delete(id);
+        }
+        return { deleted: { name }, settings: exportSettings };
+      });
+    } finally {
+      deletingMusic.delete(name);
     }
   }
 
@@ -645,47 +1422,14 @@ export async function createVideoServer(options = {}) {
       if (!res.writableEnded) controller.abort();
     };
     res.once("close", onClosed);
-    let handle;
-    let size = 0;
     let savedName;
     try {
-      handle = await open(
+      await streamRequestToFile(
+        req,
         tempPath,
-        constants.O_WRONLY |
-          constants.O_CREAT |
-          constants.O_EXCL |
-          (constants.O_NOFOLLOW || 0),
-        0o600,
+        maxUploadBytes,
+        "视频超过上传大小限制。",
       );
-      const limiter = new Transform({
-        transform(chunk, encoding, callback) {
-          size += chunk.length;
-          callback(
-            size > maxUploadBytes
-              ? new HttpError(413, "视频超过上传大小限制。")
-              : null,
-            chunk,
-          );
-        },
-      });
-      // Do not put req in pipeline: destroying IncomingMessage would also destroy
-      // its socket and prevent a useful JSON error when a streamed upload is too big.
-      req.pipe(limiter);
-      const onAborted = () =>
-        limiter.destroy(new HttpError(400, "上传已取消。"));
-      const onError = (error) => limiter.destroy(error);
-      req.once("aborted", onAborted);
-      req.once("error", onError);
-      try {
-        await pipeline(limiter, handle.createWriteStream());
-      } finally {
-        req.unpipe(limiter);
-        req.off("aborted", onAborted);
-        req.off("error", onError);
-      }
-      await handle.close();
-      handle = null;
-      if (!size) throw new HttpError(400, "不能上传空文件。");
       let publishPath = tempPath;
       try {
         const result = await scheduleConversion(async () => {
@@ -708,25 +1452,11 @@ export async function createVideoServer(options = {}) {
         throw new HttpError(422, "视频无法转为 H.264 MP4，请检查文件是否损坏或使用其他素材。");
       }
       await userFolder(user); // Re-check the destination before publishing.
-      const ext = path.extname(name);
-      const stem = name.slice(0, -ext.length);
-      for (let attempt = 1; attempt <= 10000; attempt += 1) {
-        savedName = attempt === 1 ? name : `${stem}_${attempt}${ext}`;
-        safeSegment(savedName);
-        try {
-          await link(publishPath, path.join(folder, savedName));
-          break;
-        } catch (error) {
-          if (error.code !== "EEXIST") throw error;
-          if (attempt === 10000)
-            throw new HttpError(409, "同名文件过多，请更换文件名。");
-        }
-      }
+      savedName = await publishUniqueFile(publishPath, folder, name);
       const info = await lstat(path.join(folder, savedName));
       return { video: videoMetadata(user, savedName, info) };
     } finally {
       res.off("close", onClosed);
-      if (handle) await handle.close().catch(() => {});
       await unlink(convertedPath).catch(() => {});
       await unlink(tempPath).catch((error) => {
         if (error.code !== "ENOENT")
@@ -851,9 +1581,9 @@ export async function createVideoServer(options = {}) {
         throw new HttpError(403, "此 Host 不允许访问。");
       }
       const url = new URL(req.url, authority.origin);
-      if (!["GET", "HEAD", "POST", "DELETE"].includes(req.method))
+      if (!["GET", "HEAD", "POST", "PUT", "DELETE"].includes(req.method))
         throw new HttpError(405, "请求方法不支持。");
-      if (["POST", "DELETE"].includes(req.method)) {
+      if (["POST", "PUT", "DELETE"].includes(req.method)) {
         const origin = req.headers.origin;
         const fetchSite = req.headers["sec-fetch-site"];
         if (
@@ -865,6 +1595,30 @@ export async function createVideoServer(options = {}) {
       }
       if (url.pathname === "/api/library" && req.method === "GET") {
         json(res, 200, await library());
+        return;
+      }
+      if (url.pathname === "/api/export-settings" && req.method === "GET") {
+        json(res, 200, {
+          settings: exportSettings,
+          music: await listMusic(),
+          maxMusicBytes,
+        });
+        return;
+      }
+      if (url.pathname === "/api/export-settings" && req.method === "PUT") {
+        json(res, 200, await saveExportSettings(req));
+        return;
+      }
+      if (url.pathname === "/api/music" && req.method === "GET") {
+        json(res, 200, { music: await listMusic(), maxMusicBytes });
+        return;
+      }
+      if (url.pathname === "/api/music" && req.method === "POST") {
+        json(res, 201, await uploadMusic(req, url, res));
+        return;
+      }
+      if (url.pathname === "/api/music" && req.method === "DELETE") {
+        json(res, 200, await deleteMusicTrack(req));
         return;
       }
       if (url.pathname === "/api/users" && req.method === "POST") {
@@ -907,6 +1661,27 @@ export async function createVideoServer(options = {}) {
         return;
       }
       if (
+        url.pathname.startsWith("/music/") &&
+        ["GET", "HEAD"].includes(req.method)
+      ) {
+        let segments;
+        try {
+          segments = url.pathname.slice(7).split("/").map(decodeURIComponent);
+        } catch {
+          throw new HttpError(400, "文件地址编码无效。");
+        }
+        if (segments.length !== 1) throw new HttpError(400, "文件地址无效。");
+        const [name] = segments;
+        safeSegment(name, "音频文件名");
+        if (path.extname(name).toLowerCase() !== ".mp3") {
+          throw new HttpError(404, "背景音乐不存在。");
+        }
+        const folder = await musicFolder(false);
+        if (!folder) throw new HttpError(404, "背景音乐不存在。");
+        await streamFile(req, res, path.join(folder, name), "audio/mpeg");
+        return;
+      }
+      if (
         url.pathname.startsWith("/media/") &&
         ["GET", "HEAD"].includes(req.method)
       ) {
@@ -935,7 +1710,15 @@ export async function createVideoServer(options = {}) {
         ["GET", "HEAD"].includes(req.method) &&
         !url.pathname.startsWith("/api/")
       ) {
-        let asset = ["/", "/upload", "/upload/", "/manage", "/manage/"].includes(url.pathname)
+        let asset = [
+          "/",
+          "/upload",
+          "/upload/",
+          "/manage",
+          "/manage/",
+          "/manage/export",
+          "/manage/export/",
+        ].includes(url.pathname)
           ? "index.html"
           : url.pathname.slice(1);
         try {

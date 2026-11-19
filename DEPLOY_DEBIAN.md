@@ -272,9 +272,9 @@ chown -R root:root /opt/video-library/videos
 chmod -R u=rwX,g=rX,o= /opt/video-library/videos
 ```
 
-在网页里点击刷新即可，无需重启。备份时保留 `/opt/video-library/videos`、私下保管的 `/opt/video-library/.env`（如有）和 `/etc/systemd/system/video-library.service`。素材目录中的 `.processed.json` 保存处理状态，应随原件一起备份。
+在网页里点击刷新即可，无需重启。备份时保留 `/opt/video-library/videos`、私下保管的 `/opt/video-library/.env`（如有）和 `/etc/systemd/system/video-library.service`。素材目录中的 `.processed.json` 保存处理状态，`.export-settings.json` 与 `.music/` 保存下载水印设置和上传的 MP3 背景音乐，均位于 `videos/` 内（已包含在 systemd 的 `ReadWritePaths=/opt/video-library/videos` 权限中，无需修改 service），备份时可一并保留。
 
-旧素材下载时需要的 H.264 MP4 缓存在 `/opt/video-library/videos/.transcoded/`，不会覆盖原件，重复下载及重启服务后可复用缓存。7 天未使用的缓存会在准备新的下载任务时清理。缓存可重新生成，备份时可排除；如需释放空间，可先停止服务再删除缓存目录。上传转换及缓存生成都需要额外磁盘空间。
+旧素材下载时需要的 H.264 MP4（以及开启水印或背景音乐后的导出缓存）保存在 `/opt/video-library/videos/.transcoded/`，不会覆盖原件，重复下载及重启服务后可复用缓存。7 天未使用的缓存会在准备新的下载任务时清理。缓存可重新生成，备份时可排除；如需释放空间，可先停止服务再删除缓存目录。在网页保存水印设置时会自动附带浏览器渲染的高清 PNG 叠加层；若仅通过接口调用而不经过网页保存，建议在 Debian 安装中文字体包（如 `fonts-noto-cjk`）以支持服务端直接渲染中文水印。上传转换及缓存生成都需要额外磁盘空间。
 
 ## 7. 常见问题
 

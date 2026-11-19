@@ -16,8 +16,24 @@ import {
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { createVideoServer } from "../server.mjs";
-import { isCompatibleVideo, normalizeVideo } from "../media-converter.mjs";
-import { BufferSource, Input, MP4 } from "mediabunny";
+import {
+  isCompatibleVideo,
+  isValidMp3,
+  normalizeVideo,
+  validateOverlayPng,
+} from "../media-converter.mjs";
+import {
+  AudioSample,
+  AudioSampleSource,
+  BufferSource,
+  BufferTarget,
+  Input,
+  MP4,
+  Mp3OutputFormat,
+  Output,
+  VideoSampleSink,
+} from "mediabunny";
+import { deflateSync } from "node:zlib";
 
 async function fixture(t, options = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "video-library-test-"));
@@ -1111,4 +1127,422 @@ test("corrupt media fails its download check without queuing a conversion", asyn
   assert.equal(response.status, 422);
   assert.match((await response.json()).error, /编码/);
   assert.equal(conversions, 0);
+});
+
+async function createMp3Buffer(durationSec = 0.25, freq = 660) {
+  const target = new BufferTarget();
+  const output = new Output({ format: new Mp3OutputFormat(), target });
+  const source = new AudioSampleSource({ codec: "mp3", bitrate: 128000 });
+  output.addAudioTrack(source);
+  await output.start();
+  const sampleRate = 44100;
+  const totalFrames = Math.max(1152, Math.round(sampleRate * durationSec));
+  const data = new Float32Array(totalFrames * 2);
+  for (let i = 0; i < totalFrames; i++) {
+    const val = 0.45 * Math.sin((2 * Math.PI * freq * i) / sampleRate);
+    data[i] = val;
+    data[totalFrames + i] = val;
+  }
+  const sample = new AudioSample({
+    format: "f32-planar",
+    sampleRate,
+    numberOfChannels: 2,
+    timestamp: 0,
+    data,
+  });
+  await source.add(sample);
+  sample.close();
+  source.close();
+  await output.finalize();
+  return Buffer.from(target.buffer);
+}
+
+function makePngBuffer(width, height, r = 0, g = 180, b = 255, a = 240) {
+  const crc32 = (buf) => {
+    let c = 0xffffffff;
+    for (const byte of buf) {
+      c ^= byte;
+      for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const t = Buffer.from(type, "ascii");
+    const l = Buffer.alloc(4);
+    l.writeUInt32BE(data.length, 0);
+    const c = Buffer.alloc(4);
+    c.writeUInt32BE(crc32(Buffer.concat([t, data])), 0);
+    return Buffer.concat([l, t, data, c]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  const rowBytes = 1 + width * 4;
+  const raw = Buffer.alloc(rowBytes * height);
+  for (let y = 0; y < height; y++) {
+    const start = y * rowBytes;
+    raw[start] = 0;
+    for (let x = 0; x < width; x++) {
+      const px = start + 1 + x * 4;
+      raw[px] = r;
+      raw[px + 1] = g;
+      raw[px + 2] = b;
+      raw[px + 3] = a;
+    }
+  }
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+test("export routes and settings API validate inputs, persist across restart, and stay lazy on startup", async (t) => {
+  const { base, videoDir, publicDir, server } = await fixture(t, {
+    inspectMusic: async () => ({ duration: 12.5, sampleRate: 44100, numberOfChannels: 2 }),
+  });
+
+  for (const route of ["/manage/export", "/manage/export/"]) {
+    assert.equal(await (await fetch(`${base}${route}`)).text(), "<h1>video library</h1>");
+  }
+
+  // Defaults do not create files on disk eagerly
+  const initialRes = await fetch(`${base}/api/export-settings`);
+  assert.equal(initialRes.status, 200);
+  const initial = await initialRes.json();
+  assert.equal(initial.settings.watermark.enabled, false);
+  assert.equal(initial.settings.music.enabled, false);
+  assert.deepEqual(initial.music, []);
+  assert.deepEqual(await readdir(videoDir), []);
+
+  // Upload an MP3 (mocked validator)
+  const up = await fetch(`${base}/api/music?name=theme.mp3`, {
+    method: "POST",
+    body: "mp3-bytes",
+  });
+  assert.equal(up.status, 201);
+  const { track } = await up.json();
+  assert.equal(track.name, "theme.mp3");
+
+  // Validation failures
+  for (const [label, payload, expectedStatus] of [
+    ["enabled watermark without text", { watermark: { enabled: true, text: "   " }, music: { enabled: false } }, 400],
+    ["enabled music without file", { watermark: { enabled: false }, music: { enabled: true, file: "" } }, 400],
+    ["missing music file", { watermark: { enabled: false }, music: { enabled: true, file: "nope.mp3" } }, 400],
+    ["bad color", { watermark: { enabled: true, text: "hi", color: "red" }, music: { enabled: false } }, 400],
+    ["bad position", { watermark: { enabled: true, text: "hi", position: "nowhere" }, music: { enabled: false } }, 400],
+    ["bad font size", { watermark: { enabled: true, text: "hi", fontSize: 5 }, music: { enabled: false } }, 400],
+    ["bad border radius", { watermark: { enabled: true, text: "hi", borderRadius: 200 }, music: { enabled: false } }, 400],
+    ["bad volume", { watermark: { enabled: false }, music: { enabled: false, volume: 1.5 } }, 400],
+    ["bad png", { settings: { watermark: { enabled: true, text: "hi" }, music: { enabled: false } }, overlayPng: "not-png" }, 400],
+  ]) {
+    const res = await fetch(`${base}/api/export-settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, expectedStatus, label);
+  }
+
+  // CSRF check
+  assert.equal(
+    (await fetch(`${base}/api/export-settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Origin: "https://evil.example" },
+      body: JSON.stringify({ watermark: { enabled: false }, music: { enabled: false } }),
+    })).status,
+    403,
+  );
+
+  // Valid save with PNG overlay
+  const png = makePngBuffer(120, 40);
+  const saveRes = await fetch(`${base}/api/export-settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      settings: {
+        watermark: {
+          enabled: true,
+          text: "我的片刻",
+          color: "#FFEE00",
+          bold: true,
+          backgroundColor: "#112233",
+          backgroundOpacity: 0.75,
+          borderRadius: 12,
+          fontSize: 36,
+          paddingX: 20,
+          paddingY: 10,
+          opacity: 0.9,
+          position: "top-left",
+          marginX: 30,
+          marginY: 20,
+        },
+        music: {
+          enabled: true,
+          file: "theme.mp3",
+          volume: 0.45,
+          loop: false,
+        },
+      },
+      overlayPng: png.toString("base64"),
+      overlayScale: 2,
+    }),
+  });
+  assert.equal(saveRes.status, 200);
+  const saved = (await saveRes.json()).settings;
+  assert.equal(saved.watermark.color, "#ffee00");
+  assert.equal(saved.watermark.bold, true);
+  assert.equal(saved.music.file, "theme.mp3");
+  assert.equal(saved.music.loop, false);
+
+  // Restart server and verify persistence
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+  const restarted = await createVideoServer({
+    videoDir,
+    publicDir,
+    inspectMusic: async () => ({ duration: 12.5, sampleRate: 44100, numberOfChannels: 2 }),
+  });
+  restarted.listen(0, "127.0.0.1");
+  await once(restarted, "listening");
+  t.after(async () => {
+    restarted.closeAllConnections();
+    await new Promise((resolve) => restarted.close(resolve));
+  });
+  const base2 = `http://127.0.0.1:${restarted.address().port}`;
+  const afterRestart = await (await fetch(`${base2}/api/export-settings`)).json();
+  assert.deepEqual(afterRestart.settings, saved);
+  assert.equal(afterRestart.music.length, 1);
+
+  // Invalid .export-settings.json fails startup without overwriting
+  const settingsFile = path.join(videoDir, ".export-settings.json");
+  await writeFile(settingsFile, "{broken");
+  await assert.rejects(createVideoServer({ videoDir, publicDir }), /无法读取导出设置/);
+  assert.equal(await readFile(settingsFile, "utf8"), "{broken");
+});
+
+test("music upload, range streaming, collision handling, validation, and deletion work safely", async (t) => {
+  const { base, root, videoDir } = await fixture(t, {
+    maxMusicBytes: 256 * 1024,
+    inspectMusic: isValidMp3,
+  });
+  const mp3 = await createMp3Buffer(0.25, 520);
+
+  // Reject non-mp3, empty, invalid mp3, and oversize mp3
+  assert.equal((await fetch(`${base}/api/music?name=bad.wav`, { method: "POST", body: mp3 })).status, 415);
+  assert.equal((await fetch(`${base}/api/music?name=empty.mp3`, { method: "POST", body: "" })).status, 400);
+  assert.equal((await fetch(`${base}/api/music?name=broken.mp3`, { method: "POST", body: "not mp3" })).status, 422);
+  assert.equal(
+    (await fetch(`${base}/api/music?name=huge.mp3`, { method: "POST", body: Buffer.alloc(300 * 1024) })).status,
+    413,
+  );
+
+  // Upload valid MP3 twice -> auto suffix _2 without overwriting
+  const first = await fetch(`${base}/api/music?name=bgm.mp3`, { method: "POST", body: mp3 });
+  assert.equal(first.status, 201);
+  const firstTrack = (await first.json()).track;
+  assert.equal(firstTrack.name, "bgm.mp3");
+  assert.ok(firstTrack.duration > 0.15);
+
+  const second = await fetch(`${base}/api/music?name=bgm.mp3`, { method: "POST", body: mp3 });
+  assert.equal(second.status, 201);
+  const secondTrack = (await second.json()).track;
+  assert.equal(secondTrack.name, "bgm_2.mp3");
+
+  // Library ignores .music folder
+  assert.deepEqual((await (await fetch(`${base}/api/library`)).json()).users, []);
+
+  // Stream with Range and reject symlinks
+  const partial = await fetch(`${base}${firstTrack.url}`, { headers: { Range: "bytes=0-15" } });
+  assert.equal(partial.status, 206);
+  assert.deepEqual(Buffer.from(await partial.arrayBuffer()), mp3.subarray(0, 16));
+
+  await writeFile(path.join(root, "secret.mp3"), mp3);
+  await symlink(path.join(root, "secret.mp3"), path.join(videoDir, ".music", "link.mp3"));
+  assert.equal((await fetch(`${base}/music/link.mp3`)).status, 404);
+  assert.equal((await fetch(`${base}/music/%2E%2E%2Fsecret.mp3`)).status, 400);
+
+  // Select bgm.mp3 in settings, then delete it -> auto-clears music settings
+  await fetch(`${base}/api/export-settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      watermark: { enabled: false },
+      music: { enabled: true, file: "bgm.mp3", volume: 0.5, loop: true },
+    }),
+  });
+  const delRes = await fetch(`${base}/api/music`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "bgm.mp3" }),
+  });
+  assert.equal(delRes.status, 200);
+  const delData = await delRes.json();
+  assert.equal(delData.settings.music.enabled, false);
+  assert.equal(delData.settings.music.file, "");
+  assert.equal((await fetch(`${base}/music/bgm.mp3`)).status, 404);
+  const listAfter = (await (await fetch(`${base}/api/music`)).json()).music;
+  assert.deepEqual(listAfter.map((m) => m.name), ["bgm_2.mp3"]);
+});
+
+test("deleting an MP3 currently in use by an active download returns 409 until conversion finishes", async (t) => {
+  const gate = Promise.withResolvers();
+  const started = Promise.withResolvers();
+  const { base, videoDir } = await fixture(t, {
+    inspectMusic: async () => ({ duration: 1, sampleRate: 44100, numberOfChannels: 2 }),
+    normalizeVideo: async ({ outputPath }) => {
+      started.resolve();
+      await gate.promise;
+      await writeFile(outputPath, "mixed");
+      return { converted: true };
+    },
+  });
+  await mkdir(path.join(videoDir, "alice"));
+  await writeFile(path.join(videoDir, "alice", "clip.mp4"), "video");
+  await fetch(`${base}/api/music?name=active.mp3`, { method: "POST", body: "mp3" });
+  await fetch(`${base}/api/export-settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      watermark: { enabled: false },
+      music: { enabled: true, file: "active.mp3", volume: 0.4, loop: true },
+    }),
+  });
+
+  const dlRes = await startDownload(base, "alice", "clip.mp4");
+  assert.equal(dlRes.status, 202);
+  const job = (await dlRes.json()).job;
+  await started.promise;
+
+  try {
+    const busyDel = await fetch(`${base}/api/music`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "active.mp3" }),
+    });
+    assert.equal(busyDel.status, 409);
+  } finally {
+    gate.resolve();
+  }
+  assert.equal((await waitForDownload(base, job)).status, "ready");
+  const okDel = await fetch(`${base}/api/music`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "active.mp3" }),
+  });
+  assert.equal(okDel.status, 200);
+});
+
+test("downloads apply mediabunny watermark + MP3 music to compatible MP4s, cache per settings, keep uploads clean, and clean all variants on video delete", async (t) => {
+  const { base, videoDir, publicDir, server } = await fixture(t, {
+    isCompatibleVideo,
+    normalizeVideo,
+    inspectMusic: isValidMp3,
+    validateOverlayPng,
+  });
+
+  // Upload a clean compatible H.264 MP4 and an MP3
+  await createUser(base, "alice");
+  const h264 = await sample("h264-aac.mp4");
+  const upVideo = await upload(base, "alice", "20261119_clean.mp4", h264);
+  assert.equal(upVideo.status, 201);
+  const video = (await upVideo.json()).video;
+
+  const mp3 = await createMp3Buffer(0.2, 880);
+  const upMusic = await fetch(`${base}/api/music?name=loop.mp3`, { method: "POST", body: mp3 });
+  assert.equal(upMusic.status, 201);
+
+  // Enable watermark (blue PNG overlay) + background music
+  const bluePng = makePngBuffer(160, 80, 0, 120, 255, 230);
+  const saveRes = await fetch(`${base}/api/export-settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      settings: {
+        watermark: {
+          enabled: true,
+          text: "测试水印",
+          color: "#ffffff",
+          bold: true,
+          backgroundColor: "#0078ff",
+          backgroundOpacity: 0.9,
+          borderRadius: 10,
+          fontSize: 32,
+          paddingX: 16,
+          paddingY: 8,
+          opacity: 1,
+          position: "top-left",
+          marginX: 20,
+          marginY: 20,
+        },
+        music: {
+          enabled: true,
+          file: "loop.mp3",
+          volume: 0.5,
+          loop: true,
+        },
+      },
+      overlayPng: bluePng.toString("base64"),
+      overlayScale: 1,
+    }),
+  });
+  assert.equal(saveRes.status, 200);
+
+  // Uploading another video while export effects are active MUST still keep source untouched!
+  const upClean2 = await upload(base, "alice", "20261119_raw.mp4", h264);
+  assert.equal(upClean2.status, 201);
+  assert.deepEqual(
+    await readFile(path.join(videoDir, "alice", (await upClean2.json()).video.name)),
+    h264,
+  );
+
+  // Compatible H.264 MP4 MUST now queue mediabunny processing (202) instead of bypassing!
+  const dlStart = await startDownload(base, "alice", video.name);
+  assert.equal(dlStart.status, 202);
+  const firstJob = await waitForDownload(base, (await dlStart.json()).job);
+  assert.equal(firstJob.status, "ready");
+  assert.deepEqual(firstJob.effects, { watermark: true, music: true });
+  const exportedBytes = Buffer.from(await (await fetch(`${base}${firstJob.downloadUrl}`)).arrayBuffer());
+  await assertCompatibleMp4(exportedBytes);
+  assert.notDeepEqual(exportedBytes, h264);
+
+  // Repeat download returns immediate cache hit (200)
+  const cachedStart = await startDownload(base, "alice", video.name);
+  assert.equal(cachedStart.status, 200);
+  assert.equal((await cachedStart.json()).job.id, firstJob.id);
+
+  // Changing settings creates a second variant (202)
+  await fetch(`${base}/api/export-settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      settings: {
+        watermark: { enabled: true, text: "VARIANT2", position: "bottom-right" },
+        music: { enabled: false, file: "loop.mp3", volume: 0.5, loop: true },
+      },
+    }),
+  });
+  const secondStart = await startDownload(base, "alice", video.name);
+  assert.equal(secondStart.status, 202);
+  const secondJob = await waitForDownload(base, (await secondStart.json()).job);
+  assert.equal(secondJob.status, "ready");
+  assert.notEqual(secondJob.id, firstJob.id);
+  assert.equal((await readdir(path.join(videoDir, ".transcoded"))).length, 2);
+
+  // Restart server and delete video -> removes ALL cached variants
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+  const restarted = await createVideoServer({ videoDir, publicDir });
+  restarted.listen(0, "127.0.0.1");
+  await once(restarted, "listening");
+  t.after(async () => {
+    restarted.closeAllConnections();
+    await new Promise((resolve) => restarted.close(resolve));
+  });
+  const base2 = `http://127.0.0.1:${restarted.address().port}`;
+  assert.equal((await deleteVideo(base2, video)).status, 200);
+  assert.deepEqual(await readdir(path.join(videoDir, ".transcoded")), []);
 });
